@@ -18,7 +18,7 @@ RESID_INC = -I.
 LIBS     = -lncurses -lasound -lresid-builder -lm -lstdc++
 
 TARGET   = supersynth
-OBJS     = supersynth.o resid_wrap.o
+OBJS     = supersynth.o resid_wrap.o sixel.o
 
 all: $(TARGET)
 
@@ -30,6 +30,9 @@ supersynth.o: supersynth.c
 
 resid_wrap.o: resid_wrap.cpp
 	$(CXX) $(CXXFLAGS) $(RESID_INC) -c -o $@ $<
+
+sixel.o: sixel.c sixel.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
 	rm -f $(OBJS) $(TARGET)
