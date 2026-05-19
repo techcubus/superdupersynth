@@ -15,10 +15,10 @@ CXXFLAGS = $(CFLAGS)
 RESID_INC = -I.
 # RESID_LIB = -L/usr/local/lib
 
-LIBS     = -lncurses -lasound -lresid-builder -lm -lstdc++
+LIBS     = -lncurses -lasound -lresid-builder -lm -lstdc++ -lpthread
 
 TARGET   = supersynth
-OBJS     = supersynth.o resid_wrap.o sixel.o
+OBJS     = supersynth.o resid_wrap.o sixel.o midi.o
 
 all: $(TARGET)
 
@@ -32,6 +32,9 @@ resid_wrap.o: resid_wrap.cpp
 	$(CXX) $(CXXFLAGS) $(RESID_INC) -c -o $@ $<
 
 sixel.o: sixel.c sixel.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+midi.o: midi.c midi.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
