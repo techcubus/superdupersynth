@@ -44,7 +44,9 @@
 #include <unistd.h>
 #include <ncurses.h>
 #include <alsa/asoundlib.h>
+#include <pthread.h>
 #include "sixel.h"
+#include "midi.h"
 
 /* reSID C++ library – we call it through a thin C wrapper declared below */
 #ifdef __cplusplus
@@ -173,6 +175,9 @@ static int key_to_note[256];
  */
 static int note_active  = 0;   /* 1 while a note is gated on */
 static int fl_sweep_pos = 0;   /* current FC_HI value for FL=2 sweep */
+
+/* protects all reSID register access against concurrent MIDI thread writes */
+static pthread_mutex_t sid_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ───────────────────────────────────────── forward decls ── */
 static void build_freq_tables(void);
@@ -438,6 +443,60 @@ static void release_note(void)
     note_active = 0;
 }
 
+/* ───────────────────────────────────────── MIDI note support ── */
+
+/*
+ * Convert a MIDI note number (0–127) to a 16-bit SID frequency word.
+ * A4 = MIDI 69 = 440 Hz; SID freq = hz * 2^24 / SID_CLOCK (PAL 985248 Hz).
+ */
+static unsigned int midi_to_sid_freq(int note)
+{
+    double hz = 440.0 * pow(2.0, (note - 69) / 12.0);
+    double f  = hz * 16777216.0 / (double)SID_CLOCK;
+    if (f > 65535.0) f = 65535.0;
+    return (unsigned int)(f + 0.5);
+}
+
+/*
+ * Gate on a note given a raw SID frequency word, applying the current
+ * patch waveform and gate bits.  Used by MIDI note-on; bypasses the
+ * note_raw[] table so MIDI has the full 128-note range regardless of
+ * any loaded user scale.
+ * Caller must hold sid_lock.
+ */
+static void play_note_freq(unsigned int freq)
+{
+    unsigned char hi = (freq >> 8) & 0xFF;
+    unsigned char lo =  freq       & 0xFF;
+    sid_write(V1_FREQ_HI, hi);
+    sid_write(V1_FREQ_LO, lo);
+    sid_write(V2_FREQ_HI, hi);   /* V2 in unison with V1 for MIDI */
+    sid_write(V2_FREQ_LO, lo);
+    sid_write(V1_CTRL, patch.w1);
+    sid_write(V2_CTRL, patch.w2);
+    note_active  = 1;
+    fl_sweep_pos = 0;
+}
+
+/*
+ * MIDI thread callbacks — called from the listener thread in midi.c.
+ * Both acquire sid_lock before touching SID state.
+ */
+static void midi_note_on_cb(int midi_note)
+{
+    unsigned int freq = midi_to_sid_freq(midi_note);
+    pthread_mutex_lock(&sid_lock);
+    play_note_freq(freq);
+    pthread_mutex_unlock(&sid_lock);
+}
+
+static void midi_note_off_cb(void)
+{
+    pthread_mutex_lock(&sid_lock);
+    release_note();
+    pthread_mutex_unlock(&sid_lock);
+}
+
 /* ───────────────────────────────────────── FL effect tick ── */
 /*
  * Advance the active FL effect by one audio buffer's worth.
@@ -497,9 +556,12 @@ static void audio_tick(void)
     int cycles_per_sample = SID_CLOCK / SAMPLE_RATE;
     int count = AUDIO_FRAMES;
 
+    /* hold lock for the full SID clock cycle — prevents MIDI callbacks from
+     * writing registers mid-computation */
+    pthread_mutex_lock(&sid_lock);
     fl_tick();  /* advance vibrato / filter sweep before clocking */
-
     resid_clock_delta(sid, cycles_per_sample * AUDIO_FRAMES, buf, &count);
+    pthread_mutex_unlock(&sid_lock);
 
     /* hand audio data to the scope module; it throttles and renders internally */
     scope_feed(buf, count);
@@ -1009,14 +1071,18 @@ static void run_main_loop(void)
             if (ch == KEY_F(1)) {
                 /* F1 – reset to default patch */
                 default_patch();
+                pthread_mutex_lock(&sid_lock);
                 apply_patch();
+                pthread_mutex_unlock(&sid_lock);
                 if (!show_values) draw_keyboard_screen();
                 continue;
             }
             if (ch == KEY_F(3)) {
                 /* F3 – randomise sound */
                 randomise_patch();
+                pthread_mutex_lock(&sid_lock);
                 apply_patch();
+                pthread_mutex_unlock(&sid_lock);
                 if (!show_values) draw_keyboard_screen();
                 continue;
             }
@@ -1028,8 +1094,10 @@ static void run_main_loop(void)
                 continue;
             }
             if (ch == KEY_F(7)) {
-                /* F7 – load patch */
+                /* F7 – load patch; apply_patch() inside load_patch() writes SID regs */
+                pthread_mutex_lock(&sid_lock);
                 load_patch();
+                pthread_mutex_unlock(&sid_lock);
                 if (!show_values) draw_keyboard_screen();
                 else              draw_values_screen();
                 continue;
@@ -1055,7 +1123,9 @@ static void run_main_loop(void)
                 continue;
             }
             if (ch == 27 /* ESC */) {
+                pthread_mutex_lock(&sid_lock);
                 release_note();
+                pthread_mutex_unlock(&sid_lock);
                 current_note = 0;
                 break;
             }
@@ -1068,9 +1138,11 @@ static void run_main_loop(void)
                 if (note > 0) {
                     clock_gettime(CLOCK_MONOTONIC, &last_key_ts);
                     if (current_note != note) {
+                        pthread_mutex_lock(&sid_lock);
                         release_note();
                         current_note = note;
                         play_note(note);
+                        pthread_mutex_unlock(&sid_lock);
                     }
                 }
             }
@@ -1083,7 +1155,9 @@ static void run_main_loop(void)
             long ms = (now.tv_sec  - last_key_ts.tv_sec)  * 1000L
                     + (now.tv_nsec - last_key_ts.tv_nsec) / 1000000L;
             if (ms >= RELEASE_MS) {
+                pthread_mutex_lock(&sid_lock);
                 release_note();
+                pthread_mutex_unlock(&sid_lock);
                 current_note = 0;
             }
         }
@@ -1126,6 +1200,9 @@ int main(int argc, char **argv)
     /* sixel detection — must happen before initscr() takes over the terminal */
     sixel_init(force_sixel);
 
+    /* MIDI input — also before initscr() so the aconnect hint prints cleanly */
+    midi_init(midi_note_on_cb, midi_note_off_cb);
+
     /* ncurses init */
     initscr();
     cbreak();
@@ -1145,7 +1222,8 @@ int main(int argc, char **argv)
 
     run_main_loop();
 
-    /* cleanup */
+    /* cleanup — stop MIDI thread before touching SID on the main thread */
+    midi_cleanup();
     endwin();
     release_note();
     close_alsa();
