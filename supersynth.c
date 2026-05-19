@@ -50,7 +50,7 @@ void  resid_clock_delta(void *sid, int cycles, short *buf, int *count);
 /* ───────────────────────────────────────── constants ── */
 #define SAMPLE_RATE   44100
 #define SID_CLOCK     985248   /* PAL */
-#define AUDIO_FRAMES  2048
+#define AUDIO_FRAMES  512    /* ~12ms per block; balances latency vs underrun risk */
 #define MAX_NOTES     65       /* indices 0-64, index 0 unused */
 
 /* SID register offsets (base address implied) */
@@ -260,7 +260,11 @@ static void init_alsa(void)
     snd_pcm_hw_params_t *hw;
     unsigned int rate = SAMPLE_RATE;
 
-    err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+    /* Blocking mode: snd_pcm_writei will block until ALSA has consumed one
+     * period, which paces the main loop to wall-clock time automatically.
+     * Non-blocking caused the loop to spin at CPU speed, filling the buffer
+     * instantly and dropping everything thereafter. */
+    err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) { fprintf(stderr,"ALSA open: %s\n",snd_strerror(err)); exit(1); }
 
     snd_pcm_hw_params_alloca(&hw);
@@ -270,6 +274,7 @@ static void init_alsa(void)
     snd_pcm_hw_params_set_channels(pcm, hw, 1);
     snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, 0);
     snd_pcm_hw_params_set_period_size(pcm, hw, AUDIO_FRAMES, 0);
+    snd_pcm_hw_params_set_buffer_size(pcm, hw, AUDIO_FRAMES * 4); /* 4 periods of headroom */
     snd_pcm_hw_params(pcm, hw);
     snd_pcm_prepare(pcm);
 }
@@ -381,11 +386,12 @@ static void audio_tick(void)
 
     int written = snd_pcm_writei(pcm, buf, count);
     if (written == -EPIPE) {
-        /* underrun — reset PCM state and continue */
+        /* underrun — reset PCM state and retry next tick */
         snd_pcm_prepare(pcm);
+    } else if (written < 0) {
+        /* other ALSA error — attempt recovery */
+        snd_pcm_recover(pcm, written, 1);
     }
-    /* -EAGAIN (buffer full, non-blocking) is silently dropped; the SID
-     * envelope still advances even if this buffer doesn't reach the speaker */
 }
 
 /* ───────────────────────────────────────── randomise patch ── */
