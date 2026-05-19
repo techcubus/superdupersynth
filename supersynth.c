@@ -300,17 +300,19 @@ static int adsr_sr(void) { return (patch.su & 0xF) << 4 | (patch.re & 0xF); }
 static void apply_patch(void)
 {
     int ad = adsr_ad(), sr = adsr_sr();
-    sid_write(V1_AD,  ad);
-    sid_write(V1_SR,  sr);
-    sid_write(V2_AD,  ad);
-    sid_write(V2_SR,  sr);
-    sid_write(FC_LO,  patch.db);
-    sid_write(V2_PW_LO, patch.dc);
-    sid_write(V3_PW_LO, patch.dd);
+    sid_write(V1_AD,   ad);
+    sid_write(V1_SR,   sr);
+    sid_write(V2_AD,   ad);
+    sid_write(V2_SR,   sr);
+    /* BASIC: POKEV+3,DB / V+10,DC / V+17,DD  →  PW HI regs */
+    sid_write(V1_PW_HI,  patch.db);
+    sid_write(V2_PW_HI,  patch.dc);
+    sid_write(V3_PW_HI,  patch.dd);
     sid_write(V3_FREQ_LO, patch.vi);
-    sid_write(V3_FREQ_HI, patch.vs);
-    sid_write(RES_FILT, patch.po);
-    sid_write(MODE_VOL, patch.vo);
+    /* BASIC: POKEV+18,VS  →  V3 control register (waveform for LFO voice) */
+    sid_write(V3_CTRL,   patch.vs);
+    sid_write(RES_FILT,  patch.po);
+    sid_write(MODE_VOL,  patch.vo);
 }
 
 /* ───────────────────────────────────────── note on/off ── */
@@ -318,28 +320,35 @@ static void play_note(int t)
 {
     if (t <= 0 || t >= MAX_NOTES) return;
 
+    /*
+     * Freq table layout: F1/G1/H1 = high byte, F2/G2/H2 = low byte.
+     * BASIC: V1=V+1 (FREQ_HI), V2=V (FREQ_LO), V3=V+8 (V2 FREQ_HI), V4=V+7 (V2 FREQ_LO)
+     * BASIC line 460: POKEV1,F1 / POKEV2,F2 / POKEV3,F3 / POKEV4,F4
+     */
     switch (patch.z) {
-    case 1: /* normal */
-        sid_write(V1_FREQ_LO, G1[t]);
-        sid_write(V1_FREQ_HI, G2[t]);
-        sid_write(V2_FREQ_LO, G3[t]);
-        sid_write(V2_FREQ_HI, G4[t]);
+    case 1: /* octave up — G tables (BASIC line 310) */
+        sid_write(V1_FREQ_HI, G1[t]);
+        sid_write(V1_FREQ_LO, G2[t]);
+        sid_write(V2_FREQ_HI, G3[t]);
+        sid_write(V2_FREQ_LO, G4[t]);
         break;
-    case 6: /* octave down */
-        sid_write(V1_FREQ_LO, H1[t]);
-        sid_write(V1_FREQ_HI, H2[t]);
-        sid_write(V2_FREQ_LO, H3[t]);
-        sid_write(V2_FREQ_HI, H4[t]);
+    case 6: /* octave down — H tables (BASIC line 320) */
+        sid_write(V1_FREQ_HI, H1[t]);
+        sid_write(V1_FREQ_LO, H2[t]);
+        sid_write(V2_FREQ_HI, H3[t]);
+        sid_write(V2_FREQ_LO, H4[t]);
         break;
-    default: /* modes 2-5: normal freq + filter variations */
-        sid_write(V1_FREQ_LO, F1[t]);
-        sid_write(V1_FREQ_HI, F2[t]);
-        sid_write(V2_FREQ_LO, F3[t]);
-        sid_write(V2_FREQ_HI, F4[t]);
-        if (patch.z == 4)
-            sid_write(FC_HI, (int)(F1[t] / 0.7));
-        else if (patch.z == 5)
-            sid_write(FC_HI, F1[t] / 2);
+    default: /* modes 2-5: normal freq (BASIC line 460 via gosub) */
+        sid_write(V1_FREQ_HI, F1[t]);
+        sid_write(V1_FREQ_LO, F2[t]);
+        sid_write(V2_FREQ_HI, F3[t]);
+        sid_write(V2_FREQ_LO, F4[t]);
+        /* BASIC line 340: POKEV+15,F1(T)/.7  — V+15 = V3_FREQ_HI */
+        if (patch.z == 3)
+            sid_write(V3_FREQ_HI, (int)(F1[t] / 0.7));
+        /* BASIC line 350: POKEV+15,F1(T)/2 */
+        else if (patch.z == 4)
+            sid_write(V3_FREQ_HI, F1[t] / 2);
         break;
     }
 
@@ -351,7 +360,7 @@ static void release_note(void)
 {
     sid_write(V1_CTRL, patch.w1 & ~1);   /* clear gate bit */
     sid_write(V2_CTRL, patch.w2 & ~1);
-    sid_write(FC_HI,   0);
+    sid_write(V3_FREQ_HI, 0);            /* BASIC line 430: POKEV+15,0 */
 }
 
 /* ───────────────────────────────────────── audio tick ── */
@@ -511,6 +520,23 @@ static void init_colors(void)
  *   ╚══════════════════════════════════════╝
  */
 
+/*
+ * Draw one horizontal border row using ACS line-drawing chars.
+ * left/sep/right are the ACS corner/tee chars for that row type.
+ * Each of the `n` cells is 2 chars wide; total width = 3n+1.
+ */
+static void kbd_hline(int y, int x, int n, chtype left, chtype sep, chtype right)
+{
+    attron(COLOR_PAIR(CP_CYAN));
+    mvaddch(y, x, left);
+    for (int i = 0; i < n; i++) {
+        addch(ACS_HLINE);
+        addch(ACS_HLINE);
+        addch(i < n - 1 ? sep : right);
+    }
+    attroff(COLOR_PAIR(CP_CYAN));
+}
+
 static void draw_keyboard_screen(void)
 {
     clear();
@@ -522,172 +548,139 @@ static void draw_keyboard_screen(void)
         mvaddch(23, c, ACS_HLINE);
     }
     for (int r = 1; r < 23; r++) {
-        mvaddch(r, 0,  ACS_VLINE);
+        mvaddch(r,  0, ACS_VLINE);
         mvaddch(r, 79, ACS_VLINE);
     }
-    mvaddch(0,  0,  ACS_ULCORNER);
-    mvaddch(0,  79, ACS_URCORNER);
-    mvaddch(23, 0,  ACS_LLCORNER);
-    mvaddch(23, 79, ACS_LRCORNER);
+    mvaddch(0,   0, ACS_ULCORNER);  mvaddch(0,  79, ACS_URCORNER);
+    mvaddch(23,  0, ACS_LLCORNER);  mvaddch(23, 79, ACS_LRCORNER);
     attroff(COLOR_PAIR(CP_CYAN));
 
-    /* ── title bar ── */
+    /* ── title ── */
     attron(COLOR_PAIR(CP_TITLE) | A_BOLD);
     mvprintw(1, 25, "  *** SUPER-SYNTH ***  ");
     attroff(COLOR_PAIR(CP_TITLE) | A_BOLD);
 
     /* ── function key hints ── */
-    attron(COLOR_PAIR(CP_YELLOW));
-    mvprintw(2, 4,  "F1");  attroff(COLOR_PAIR(CP_YELLOW));
-    printw("-Normal  ");
-    attron(COLOR_PAIR(CP_YELLOW));
-    printw("F3");           attroff(COLOR_PAIR(CP_YELLOW));
-    printw("-New Snd  ");
-    attron(COLOR_PAIR(CP_YELLOW));
-    printw("F5");           attroff(COLOR_PAIR(CP_YELLOW));
-    printw("-Save  ");
-    attron(COLOR_PAIR(CP_YELLOW));
-    printw("F7");           attroff(COLOR_PAIR(CP_YELLOW));
-    printw("-Load  ");
-    attron(COLOR_PAIR(CP_YELLOW));
-    printw("ENTER");        attroff(COLOR_PAIR(CP_YELLOW));
-    printw("-Values  ");
-    attron(COLOR_PAIR(CP_YELLOW));
-    printw("ESC");          attroff(COLOR_PAIR(CP_YELLOW));
-    printw("-Quit");
+    move(2, 4);
+    attron(COLOR_PAIR(CP_YELLOW));  addstr("F1");    attroff(COLOR_PAIR(CP_YELLOW));
+    addstr("-Normal  ");
+    attron(COLOR_PAIR(CP_YELLOW));  addstr("F3");    attroff(COLOR_PAIR(CP_YELLOW));
+    addstr("-New  ");
+    attron(COLOR_PAIR(CP_YELLOW));  addstr("F5");    attroff(COLOR_PAIR(CP_YELLOW));
+    addstr("-Save  ");
+    attron(COLOR_PAIR(CP_YELLOW));  addstr("F7");    attroff(COLOR_PAIR(CP_YELLOW));
+    addstr("-Load  ");
+    attron(COLOR_PAIR(CP_YELLOW));  addstr("ENTER"); attroff(COLOR_PAIR(CP_YELLOW));
+    addstr("-Values  ");
+    attron(COLOR_PAIR(CP_YELLOW));  addstr("ESC");   attroff(COLOR_PAIR(CP_YELLOW));
+    addstr("-Quit");
 
-    /* ── keyboard graphic ── */
+    /*
+     * Keyboard layout — two sections, each cell 2 chars wide + 1 border.
+     * Total width per section: 3n+1 chars, starting at column KX=4.
+     *
+     * Upper (13 cells): number row (black keys) above QWERTY row (white keys)
+     *   rows 4-8,  width = 40 cols
+     *
+     * Lower (11 cells): A-row (white) above Z-row (extra notes)
+     *   rows 10-14, width = 34 cols
+     *
+     * Space in a key string = no key / blank cell.
+     */
+    const int KX  = 4;
+    const int NUP = 13;
+    const int NLO = 11;
 
-    /* top row – black keys above white keys */
-    /* row 4: key tops */
-    attron(COLOR_PAIR(CP_CYAN));
-    mvprintw(4, 4, " ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐");
-    /* black key row: 2 3  5 6 7  9 0  - = */
-    mvprintw(5, 4, " │");
-    attroff(COLOR_PAIR(CP_CYAN));
+    /* one char per cell position, space = blank */
+    static const char blk_up[] = " 23 567 90 -=";  /* number row */
+    static const char wht_up[] = "QWERTYUIOP[\\]"; /* QWERTY row */
+    static const char wht_lo[] = "ASDFGHJKL;'";    /* A row      */
+    static const char blk_lo[] = "ZXCVBNM,./ ";    /* Z row      */
 
-    const char *top_keys = " 2 3   5 6 7   9 0   - =";
-    for (int i = 0; top_keys[i]; i++) {
-        if (top_keys[i] != ' ') {
-            attron(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
-            addch(top_keys[i]);
-            attroff(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
-        } else {
-            attron(COLOR_PAIR(CP_CYAN));
-            addch(' ');
-            attroff(COLOR_PAIR(CP_CYAN));
-        }
-        attron(COLOR_PAIR(CP_CYAN));
-        addch('|');
-        attroff(COLOR_PAIR(CP_CYAN));
-    }
-
-    /* white key row: Q W E R T Y U I O P [ \ ] */
-    attron(COLOR_PAIR(CP_CYAN));
-    mvprintw(6, 4, " │");
-    attroff(COLOR_PAIR(CP_CYAN));
-
-    const char *upper_keys = "Q W E R T Y U I O P [ \\ ]";
-    for (int i = 0; upper_keys[i]; i++) {
-        char c = upper_keys[i];
-        if (c != ' ') {
-            attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
-            addch(c);
-            attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
-        } else {
-            attron(COLOR_PAIR(CP_CYAN));
-            addch(' ');
-            attroff(COLOR_PAIR(CP_CYAN));
-        }
-        attron(COLOR_PAIR(CP_CYAN));
-        addch('|');
-        attroff(COLOR_PAIR(CP_CYAN));
-    }
+    /* ── upper keyboard ── */
+    kbd_hline(4, KX, NUP, ACS_ULCORNER, ACS_TTEE, ACS_URCORNER);
 
     attron(COLOR_PAIR(CP_CYAN));
-    mvprintw(7, 4, " ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤");
-    mvprintw(8, 4, " │");
+    mvaddch(5, KX, ACS_VLINE);
     attroff(COLOR_PAIR(CP_CYAN));
-
-    /* middle row – black-key row above lower white keys */
-    const char *mid_black = " D F   H J K   : '";
-    for (int i = 0; mid_black[i]; i++) {
-        char c = mid_black[i];
+    for (int i = 0; i < NUP; i++) {
+        char c = blk_up[i];
         if (c != ' ') {
             attron(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
-            addch(c);
+            addch(c); addch(' ');
             attroff(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
         } else {
-            attron(COLOR_PAIR(CP_CYAN));
-            addch(' ');
-            attroff(COLOR_PAIR(CP_CYAN));
+            addch(' '); addch(' ');
         }
         attron(COLOR_PAIR(CP_CYAN));
-        addch('|');
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_CYAN));
     }
 
-    attron(COLOR_PAIR(CP_CYAN));
-    mvprintw(9, 4, " │");
-    attroff(COLOR_PAIR(CP_CYAN));
+    kbd_hline(6, KX, NUP, ACS_LTEE, ACS_PLUS, ACS_RTEE);
 
-    /* lower white keys: A S D F G H J K L ; ' */
-    const char *lower_keys = "A S D F G H J K L ; '";
-    for (int i = 0; lower_keys[i]; i++) {
-        char c = lower_keys[i];
+    attron(COLOR_PAIR(CP_CYAN));
+    mvaddch(7, KX, ACS_VLINE);
+    attroff(COLOR_PAIR(CP_CYAN));
+    for (int i = 0; i < NUP; i++) {
+        attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+        addch(wht_up[i]); addch(' ');
+        attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+        attron(COLOR_PAIR(CP_CYAN));
+        addch(ACS_VLINE);
+        attroff(COLOR_PAIR(CP_CYAN));
+    }
+
+    kbd_hline(8, KX, NUP, ACS_LLCORNER, ACS_BTEE, ACS_LRCORNER);
+
+    /* ── lower keyboard ── */
+    kbd_hline(10, KX, NLO, ACS_ULCORNER, ACS_TTEE, ACS_URCORNER);
+
+    attron(COLOR_PAIR(CP_CYAN));
+    mvaddch(11, KX, ACS_VLINE);
+    attroff(COLOR_PAIR(CP_CYAN));
+    for (int i = 0; i < NLO; i++) {
+        attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+        addch(wht_lo[i]); addch(' ');
+        attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+        attron(COLOR_PAIR(CP_CYAN));
+        addch(ACS_VLINE);
+        attroff(COLOR_PAIR(CP_CYAN));
+    }
+
+    kbd_hline(12, KX, NLO, ACS_LTEE, ACS_PLUS, ACS_RTEE);
+
+    attron(COLOR_PAIR(CP_CYAN));
+    mvaddch(13, KX, ACS_VLINE);
+    attroff(COLOR_PAIR(CP_CYAN));
+    for (int i = 0; i < NLO; i++) {
+        char c = blk_lo[i];
         if (c != ' ') {
-            attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
-            addch(c);
-            attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+            attron(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
+            addch(c); addch(' ');
+            attroff(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
         } else {
-            attron(COLOR_PAIR(CP_CYAN));
-            addch(' ');
-            attroff(COLOR_PAIR(CP_CYAN));
+            addch(' '); addch(' ');
         }
         attron(COLOR_PAIR(CP_CYAN));
-        addch('|');
+        addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_CYAN));
     }
 
-    attron(COLOR_PAIR(CP_CYAN));
-    mvprintw(10, 4, " ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤");
-    mvprintw(11, 4, " │");
-    attroff(COLOR_PAIR(CP_CYAN));
+    kbd_hline(14, KX, NLO, ACS_LLCORNER, ACS_BTEE, ACS_LRCORNER);
 
-    /* bottom row: Z X C V B N M , . / */
-    const char *bottom_keys = "Z X C V B N M , . /";
-    for (int i = 0; bottom_keys[i]; i++) {
-        char c = bottom_keys[i];
-        if (c != ' ') {
-            attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
-            addch(c);
-            attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
-        } else {
-            attron(COLOR_PAIR(CP_CYAN));
-            addch(' ');
-            attroff(COLOR_PAIR(CP_CYAN));
-        }
-        attron(COLOR_PAIR(CP_CYAN));
-        addch('|');
-        attroff(COLOR_PAIR(CP_CYAN));
-    }
-
-    attron(COLOR_PAIR(CP_CYAN));
-    mvprintw(12, 4, " └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘");
-    attroff(COLOR_PAIR(CP_CYAN));
-
-    /* ── current patch summary ── */
+    /* ── patch summary ── */
     attron(COLOR_PAIR(CP_GREEN));
-    mvprintw(14, 4, "Mode: %d  FL: %d  W1: %3d  W2: %3d  AT:%2d DE:%2d SU:%2d RE:%2d",
+    mvprintw(16, 4, "Mode:%d FL:%d W1:%3d W2:%3d  AT:%2d DE:%2d SU:%2d RE:%2d",
              patch.z, patch.fl, patch.w1, patch.w2,
              patch.at, patch.de, patch.su, patch.re);
-    mvprintw(15, 4, "Vol: %2d  Res: %3d  VI: %3d  VS: %3d  SL: %3d",
+    mvprintw(17, 4, "Vol:%2d Res:%3d VI:%3d VS:%3d  SL:%3d",
              patch.vo, patch.po, patch.vi, patch.vs, patch.sl);
     attroff(COLOR_PAIR(CP_GREEN));
 
     /* ── status bar ── */
     attron(COLOR_PAIR(CP_YELLOW));
-    mvprintw(22, 2, " Play keys shown above. Hold key for sustain. ");
+    mvprintw(22, 2, " Play keys above. Hold for sustain. ESC=Quit ");
     attroff(COLOR_PAIR(CP_YELLOW));
 
     refresh();

@@ -19,10 +19,9 @@
 /* Try the most common header locations in order */
 #if __has_include(<resid/sid.h>)
 #  include <resid/sid.h>
-   using namespace reSID;
+   /* sidplay-libs 2.x reSID: global namespace, no reSID:: prefix */
 #elif __has_include(<sid.h>)
 #  include <sid.h>
-   using namespace reSID;
 #else
 #  error "Cannot find reSID headers. Install libresid-dev or adjust include path."
 #endif
@@ -54,7 +53,7 @@ void resid_reset(void *sid)
 int resid_write(void *sid, int reg, int val)
 {
     SID *s = static_cast<SID *>(sid);
-    s->write(static_cast<reg_t>(reg), static_cast<reg8>(val & 0xFF));
+    s->write(static_cast<reg8>(reg), static_cast<reg8>(val & 0xFF));
     return 0;
 }
 

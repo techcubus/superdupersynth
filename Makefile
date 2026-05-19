@@ -11,11 +11,11 @@ CC       = gcc
 CFLAGS   = -O2 -Wall -Wextra
 CXXFLAGS = $(CFLAGS)
 
-# Uncomment and adjust if headers/libs are not in the default search path:
-# RESID_INC = -I/usr/local/include
+# Vendored reSID headers live in ./resid/ (from sidplay-libs 2.1.1 source)
+RESID_INC = -I.
 # RESID_LIB = -L/usr/local/lib
 
-LIBS     = -lncurses -lasound -lresid -lm -lstdc++
+LIBS     = -lncurses -lasound -lresid-builder -lm -lstdc++
 
 TARGET   = supersynth
 OBJS     = supersynth.o resid_wrap.o

@@ -1,6 +1,9 @@
 # Prerequisites
 *.d
 
+# Build output
+supersynth
+
 # Object files
 *.o
 *.ko
