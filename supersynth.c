@@ -44,6 +44,7 @@
 #include <unistd.h>
 #include <ncurses.h>
 #include <alsa/asoundlib.h>
+#include "sixel.h"
 
 /* reSID C++ library – we call it through a thin C wrapper declared below */
 #ifdef __cplusplus
@@ -500,6 +501,9 @@ static void audio_tick(void)
 
     resid_clock_delta(sid, cycles_per_sample * AUDIO_FRAMES, buf, &count);
 
+    /* hand audio data to the scope module; it throttles and renders internally */
+    scope_feed(buf, count);
+
     int written = snd_pcm_writei(pcm, buf, count);
     if (written == -EPIPE) {
         /* underrun — reset PCM state and retry next tick */
@@ -931,6 +935,9 @@ static void draw_keyboard_screen(void)
     attroff(COLOR_PAIR(CP_YELLOW));
 
     refresh();
+
+    /* overlay scope after ncurses has flushed — sixel persists until next clear() */
+    scope_redraw();
 }
 
 static void draw_values_screen(void)
@@ -1091,12 +1098,16 @@ int main(int argc, char **argv)
 {
     const char *scale_file = NULL;
 
-    /* parse CLI flags: -s <scale_file> */
+    int force_sixel = 0;
+
+    /* parse CLI flags: -s <scale_file>  -x (force sixel) */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
             scale_file = argv[++i];
+        else if (strcmp(argv[i], "-x") == 0)
+            force_sixel = 1;
         else {
-            fprintf(stderr, "Usage: %s [-s scale_file]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-s scale_file] [-x]\n", argv[0]);
             return 1;
         }
     }
@@ -1111,6 +1122,9 @@ int main(int argc, char **argv)
     init_sid();
     default_patch();
     apply_patch();
+
+    /* sixel detection — must happen before initscr() takes over the terminal */
+    sixel_init(force_sixel);
 
     /* ncurses init */
     initscr();
