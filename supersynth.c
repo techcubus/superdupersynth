@@ -11,17 +11,28 @@
  *   gcc -O2 -o supersynth supersynth.c \
  *       -lncurses -lresid -lasound -lm
  *
- * Key map  (mirrors C64 keyboard layout used in original):
- *   Q W E R T Y U I O P [ \ ]   – white keys (notes)
- *   2 3   5 6 7   9 0   - =     – black keys (sharps/flats)
- *   A S D F G H J K L : ;       – lower white keys (octave 2)
- *   Z X C V B N M , . /         – lower black-key row
- *   F1  – Normal waveform toggle
- *   F3  – New random sound
- *   F5  – Save patch to file
- *   F7  – Load patch from file
+ * Key map  (C64 scan-code → PC key, faithful to original keyboard matrix):
+ *
+ *   PC number row (black keys):  2 3   5 6 7   9 0   - ` =
+ *   PC QWERTY row (white keys):  Q W E R T Y U I O P [ ] \
+ *
+ *   PC ASDF row   (black keys):  d f   h j k   ; '
+ *   PC ZXCV row   (white keys):  Z X C V B N M , . /
+ *
+ *   The ZXCV row plays the higher octave (Z is one octave above Q).
+ *   ` = C64 £,  = = C64 ↑,  [ = C64 @,  ] = C64 *,  \ = C64 =
+ *
+ *   F1    – Reset to default patch
+ *   F3    – New random sound
+ *   F5    – Save patch to file
+ *   F7    – Load patch from file
+ *   F9    – Load scale file
+ *   F11   – Save scale file
  *   Enter – Toggle values/keyboard screen
- *   ESC  – Quit
+ *   ESC   – Quit
+ *
+ *   Scale files: one line per note key: key_char Hz
+ *   e.g.  "q 261.63"  (see -s flag or F9 in-app)
  */
 
 #define _GNU_SOURCE
@@ -114,6 +125,13 @@ typedef struct {
 } Patch;
 
 /* ───────────────────────────────────────── freq tables ── */
+/*
+ * note_raw[t] – the raw 16-bit SID frequency value for note index t.
+ * Populated from note_data at startup; can be overridden by load_scale().
+ * All F/G/H byte-pair arrays are derived from this single source of truth.
+ */
+static int note_raw[MAX_NOTES];
+
 /* F arrays – normal octave */
 static int F1[MAX_NOTES], F2[MAX_NOTES]; /* hi, lo */
 /* G arrays – octave up  */
@@ -170,6 +188,10 @@ static void draw_keyboard_screen(void);
 static void draw_values_screen(void);
 static void save_patch(void);
 static void load_patch(void);
+static void load_scale(const char *path);
+static void save_scale(const char *path);
+static void ui_load_scale(void);
+static void ui_save_scale(void);
 static void audio_tick(void);   /* push one buffer of silence / tone */
 static void run_main_loop(void);
 
@@ -180,13 +202,28 @@ static void run_main_loop(void);
 /* ───────────────────────────────────────── freq table builder ── */
 static void build_freq_tables(void)
 {
+    /* M is a slight detuning factor for voice 2 (BASIC: M=1.005). */
     const double M = 1.005;
-    const int    K = 256;
+    const int    K = 256;   /* byte split: hi = N/K, lo = N mod K */
 
-    for (int i = 0; note_data[i][0] != -1; i++) {
-        int  t  = note_data[i][0];
-        int  N  = note_data[i][1];
-        if (t <= 0 || t >= MAX_NOTES) continue;
+    /* Phase 1: seed note_raw[] from the built-in DATA table if not yet set.
+     * load_scale() may call us again after overwriting note_raw[], in which
+     * case we skip this step so user values are not clobbered. */
+    static int seeded = 0;
+    if (!seeded) {
+        for (int i = 0; note_data[i][0] != -1; i++) {
+            int t = note_data[i][0];
+            int N = note_data[i][1];
+            if (t > 0 && t < MAX_NOTES)
+                note_raw[t] = N;
+        }
+        seeded = 1;
+    }
+
+    /* Phase 2: derive F/G/H byte-pair arrays from note_raw[]. */
+    for (int t = 1; t < MAX_NOTES; t++) {
+        int N = note_raw[t];
+        if (N == 0) continue;   /* unused note index */
 
         int N1 = (int)(N * M);
         int N2 = N * 2;
@@ -205,70 +242,77 @@ static void build_freq_tables(void)
 
 /* ───────────────────────────────────────── key map ── */
 /*
- * C64 key-matrix index → ncurses keycode
- * Original program uses PEEK(197) which returns the C64 matrix position.
- * We reverse-map the same physical keys.
+ * Maps PC keycodes → C64 scan codes (= note_raw[] indices).
  *
- * Upper row (white notes):  Q W E R T Y U I O P @ * ^  Z(ctrl)
- * Upper row (black notes):  2 3 _ 5 6 7 _ 9 0 _ - \  _
- * Lower row (white notes):  A S D F G H J K L : ;
- * Lower row (black notes):  Z X C V B N M , . /
+ * The C64 used PEEK(197) which returned a keyboard-matrix position.
+ * The formula is: scan = PA_bit * 8 + (7 - PB_bit)
+ * where PA ($DC00) is the column driven low and PB ($DC01) is the row read.
  *
- * Note indices come straight from the DATA tables.
+ * Piano layout on PC keyboard:
+ *
+ *   number row (black keys):  2  3     5  6  7     9  0     -  `  =
+ *   QWERTY row (white keys):  Q  W  E  R  T  Y  U  I  O  P  [  ]  \
+ *
+ *   ASDF row   (black keys):     d  f     h  j  k     ;  '
+ *   ZXCV row   (white keys):  Z  X  C  V  B  N  M  ,  .  /
+ *
+ * Special mappings:  [ = C64 @   ] = C64 *   \ = C64 =
+ *                    ` = C64 £   = = C64 ↑   / = C64 HOME
+ *
+ * ZXCV row plays a higher octave than QWERTY (Z is one octave above Q).
+ * A, S, G, L are not note keys (not present in the original DATA).
  */
 static void build_key_map(void)
 {
     memset(key_to_note, 0, sizeof(key_to_note));
 
-    /* Upper white keys */
-    key_to_note['q'] = 30;  key_to_note['Q'] = 30;
-    key_to_note['w'] = 33;  key_to_note['W'] = 33;
-    key_to_note['e'] = 38;  key_to_note['E'] = 38;
-    key_to_note['r'] = 41;  key_to_note['R'] = 41;
-    key_to_note['t'] = 46;  key_to_note['T'] = 46;
-    key_to_note['y'] = 49;  key_to_note['Y'] = 49;
-    key_to_note['u'] = 54;  key_to_note['U'] = 54;
-    key_to_note['i'] = 12;  key_to_note['I'] = 12;
-    key_to_note['o'] = 23;  key_to_note['O'] = 23;
-    key_to_note['p'] = 20;  key_to_note['P'] = 20;
-    key_to_note['['] = 31;  /* @ on C64 */
-    key_to_note[']'] = 28;  /* * on C64 */
+    /* QWERTY row — white keys, lower octave */
+    key_to_note['q'] = 62;  key_to_note['Q'] = 62;  /* C64 Q  */
+    key_to_note['w'] = 9;   key_to_note['W'] = 9;   /* C64 W  */
+    key_to_note['e'] = 14;  key_to_note['E'] = 14;  /* C64 E  */
+    key_to_note['r'] = 17;  key_to_note['R'] = 17;  /* C64 R  */
+    key_to_note['t'] = 22;  key_to_note['T'] = 22;  /* C64 T  */
+    key_to_note['y'] = 25;  key_to_note['Y'] = 25;  /* C64 Y  */
+    key_to_note['u'] = 30;  key_to_note['U'] = 30;  /* C64 U  */
+    key_to_note['i'] = 33;  key_to_note['I'] = 33;  /* C64 I  */
+    key_to_note['o'] = 38;  key_to_note['O'] = 38;  /* C64 O  */
+    key_to_note['p'] = 41;  key_to_note['P'] = 41;  /* C64 P  */
+    key_to_note['['] = 46;                            /* C64 @  */
+    key_to_note[']'] = 49;                            /* C64 *  */
+    key_to_note['\\']= 54;                            /* C64 =  */
 
-    /* Upper black keys */
-    key_to_note['2'] = 9;
-    key_to_note['3'] = 14;
-    key_to_note['5'] = 22;
-    key_to_note['6'] = 25;
-    key_to_note['7'] = 36;
-    key_to_note['9'] = 44;
-    key_to_note['0'] = 47;
-    key_to_note['-'] = 39;
-    key_to_note['='] = 55;
+    /* Number row — black keys above QWERTY (sharps/flats) */
+    key_to_note['2'] = 59;  /* C64 2  */
+    key_to_note['3'] = 8;   /* C64 3  */
+    key_to_note['5'] = 16;  /* C64 5  */
+    key_to_note['6'] = 19;  /* C64 6  */
+    key_to_note['7'] = 24;  /* C64 7  */
+    key_to_note['9'] = 32;  /* C64 9  */
+    key_to_note['0'] = 35;  /* C64 0  */
+    key_to_note['-'] = 43;  /* C64 -  */
+    key_to_note['`'] = 48;  /* C64 £ (pound) */
+    key_to_note['='] = 51;  /* C64 ↑ (up-arrow) */
 
-    /* Lower white keys */
-    key_to_note['a'] = 62;  key_to_note['A'] = 62;
-    key_to_note['s'] = 59;  key_to_note['S'] = 59;
-    key_to_note['d'] = 8;   key_to_note['D'] = 8;
-    key_to_note['f'] = 16;  key_to_note['F'] = 16;
-    key_to_note['g'] = 19;  key_to_note['G'] = 19;
-    key_to_note['h'] = 24;  key_to_note['H'] = 24;
-    key_to_note['j'] = 32;  key_to_note['J'] = 32;
-    key_to_note['k'] = 35;  key_to_note['K'] = 35;
-    key_to_note['l'] = 43;  key_to_note['L'] = 43;
-    key_to_note[';'] = 48;
-    key_to_note['\'']= 51;
+    /* ZXCV row — white keys, higher octave */
+    key_to_note['z'] = 12;  key_to_note['Z'] = 12;  /* C64 Z    */
+    key_to_note['x'] = 23;  key_to_note['X'] = 23;  /* C64 X    */
+    key_to_note['c'] = 20;  key_to_note['C'] = 20;  /* C64 C    */
+    key_to_note['v'] = 31;  key_to_note['V'] = 31;  /* C64 V    */
+    key_to_note['b'] = 28;  key_to_note['B'] = 28;  /* C64 B    */
+    key_to_note['n'] = 39;  key_to_note['N'] = 39;  /* C64 N    */
+    key_to_note['m'] = 36;  key_to_note['M'] = 36;  /* C64 M    */
+    key_to_note[','] = 47;                            /* C64 ,    */
+    key_to_note['.'] = 44;                            /* C64 .    */
+    key_to_note['/'] = 55;                            /* C64 HOME */
 
-    /* Lower black keys */
-    key_to_note['z'] = 18;  key_to_note['Z'] = 18;
-    key_to_note['x'] = 21;  key_to_note['X'] = 21;
-    key_to_note['c'] = 29;  key_to_note['C'] = 29;
-    key_to_note['v'] = 34;  key_to_note['V'] = 34;
-    key_to_note['b'] = 37;  key_to_note['B'] = 37;
-    key_to_note['n'] = 45;  key_to_note['N'] = 45;
-    key_to_note['m'] = 50;  key_to_note['M'] = 50;
-    key_to_note[','] = 17;
-    key_to_note['.'] = 62; /* re-used; adjust if collision */
-    key_to_note['/'] = 55;
+    /* ASDF row — black keys above ZXCV */
+    key_to_note['d'] = 18;  key_to_note['D'] = 18;  /* C64 D  */
+    key_to_note['f'] = 21;  key_to_note['F'] = 21;  /* C64 F  */
+    key_to_note['h'] = 29;  key_to_note['H'] = 29;  /* C64 H  */
+    key_to_note['j'] = 34;  key_to_note['J'] = 34;  /* C64 J  */
+    key_to_note['k'] = 37;  key_to_note['K'] = 37;  /* C64 K  */
+    key_to_note[';'] = 45;                            /* C64 :  */
+    key_to_note['\'']= 50;                            /* C64 ;  */
 }
 
 /* ───────────────────────────────────────── ALSA init ── */
@@ -558,6 +602,112 @@ static void load_patch(void)
     apply_patch();
 }
 
+/* ───────────────────────────────────────── scale load / save ── */
+/*
+ * Scale file format — plain text, one note per line:
+ *   key_char  frequency_in_Hz
+ * e.g.:
+ *   q 261.63
+ *   2 277.18
+ *   w 293.66
+ * Lines beginning with # are comments.  Blank lines are ignored.
+ * key_char is the PC key character (lower-case).
+ * Frequency is in Hz (float); the SID value is computed automatically:
+ *   sid_freq = round(hz * 16777216 / SID_CLOCK)
+ * Only keys present in the file are updated; the rest keep their current value.
+ */
+
+static void load_scale(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        mvprintw(14, 4, "ERROR: cannot open scale file: %s", path);
+        refresh();
+        return;
+    }
+
+    char line[256];
+    int  count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        /* skip comments and blank lines */
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+
+        char   key_ch;
+        double hz;
+        if (sscanf(line, " %c %lf", &key_ch, &hz) != 2) continue;
+        if (hz <= 0.0) continue;
+
+        /* look up the note index for this PC key character */
+        int idx = (unsigned char)key_ch;
+        if (idx >= 256) continue;
+        int t = key_to_note[idx];
+        if (t == 0) {
+            /* also try lower-case version */
+            if (key_ch >= 'A' && key_ch <= 'Z') t = key_to_note[(int)(key_ch + 32)];
+        }
+        if (t == 0) continue;   /* key not mapped to a note */
+
+        /* convert Hz to 16-bit SID frequency */
+        note_raw[t] = (int)round(hz * 16777216.0 / SID_CLOCK);
+        count++;
+    }
+    fclose(f);
+
+    /* rebuild all F/G/H arrays from updated note_raw[] */
+    build_freq_tables();
+}
+
+static void save_scale(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        mvprintw(14, 4, "ERROR: cannot write scale file: %s", path);
+        refresh();
+        return;
+    }
+
+    fprintf(f, "# supersynth scale file\n");
+    fprintf(f, "# format: key_char  Hz\n");
+    fprintf(f, "# SID clock: %d Hz (PAL)\n\n", SID_CLOCK);
+
+    /* iterate note keys in frequency order (ascending note_raw value) */
+    static const char note_keys[] = "q2w3er5t6y7ui9o0p[-`=zxcvbnm,./"
+                                    "dfhjk;'";
+    for (int i = 0; note_keys[i]; i++) {
+        int idx = (unsigned char)note_keys[i];
+        int t   = key_to_note[idx];
+        if (t == 0 || note_raw[t] == 0) continue;
+        double hz = (double)note_raw[t] * SID_CLOCK / 16777216.0;
+        fprintf(f, "%c %.4f\n", note_keys[i], hz);
+    }
+    fclose(f);
+}
+
+/* Interactive wrappers that prompt in the ncurses window */
+static void ui_load_scale(void)
+{
+    char fname[256] = "";
+    echo();
+    move(12, 4); clrtoeol();
+    mvprintw(12, 4, "SCALE FILE TO LOAD: ");
+    getnstr(fname, 240);
+    noecho();
+    if (fname[0] == '\0') return;
+    load_scale(fname);
+}
+
+static void ui_save_scale(void)
+{
+    char fname[256] = "";
+    echo();
+    move(12, 4); clrtoeol();
+    mvprintw(12, 4, "SCALE FILE TO SAVE: ");
+    getnstr(fname, 240);
+    noecho();
+    if (fname[0] == '\0') return;
+    save_scale(fname);
+}
+
 /* ───────────────────────────────────────── UI ── */
 
 /* Colour pairs */
@@ -673,14 +823,25 @@ static void draw_keyboard_screen(void)
      * Space in a key string = no key / blank cell.
      */
     const int KX  = 4;
-    const int NUP = 13;
-    const int NLO = 11;
+    const int NUP = 13;   /* 13 white keys across QWERTY row */
+    const int NLO = 10;   /* 10 white keys across ZXCV row   */
 
-    /* one char per cell position, space = blank */
-    static const char blk_up[] = " 23 567 90 -=";  /* number row */
-    static const char wht_up[] = "QWERTYUIOP[\\]"; /* QWERTY row */
-    static const char wht_lo[] = "ASDFGHJKL;'";    /* A row      */
-    static const char blk_lo[] = "ZXCVBNM,./ ";    /* Z row      */
+    /*
+     * One char per cell; space = no note key at that position.
+     * blk_up: number row keys that sit above the QWERTY white keys.
+     *   Positions with no sharp (like between E-R and U-I) are spaces.
+     *   ` = C64 £,  = = C64 ↑  (both mapped to number-row keys)
+     * wht_up: the 13 QWERTY-row white note keys.
+     *   [ = C64 @,  ] = C64 *,  \ = C64 =
+     * blk_lo: ASDF-row keys that sit above the ZXCV white keys.
+     *   Only D F H J K ; ' are note keys; A S G L are control keys (space).
+     * wht_lo: the 10 ZXCV-row white note keys.
+     *   / = C64 HOME (last key in this row)
+     */
+    static const char blk_up[] = " 23 567 90 -`";  /* number row (13 positions); = (C64 ↑) not shown */
+    static const char wht_up[] = "QWERTYUIOP[\\]";  /* QWERTY row (13 keys)     */
+    static const char blk_lo[] = " DF HJK ;'";      /* ASDF row  (10 positions) */
+    static const char wht_lo[] = "ZXCVBNM,./";      /* ZXCV row  (10 keys)      */
 
     /* ── upper keyboard ── */
     kbd_hline(4, KX, NUP, ACS_ULCORNER, ACS_TTEE, ACS_URCORNER);
@@ -719,15 +880,21 @@ static void draw_keyboard_screen(void)
     kbd_hline(8, KX, NUP, ACS_LLCORNER, ACS_BTEE, ACS_LRCORNER);
 
     /* ── lower keyboard ── */
+    /* Upper row = ASDF black keys (CP_BLACK_K); lower row = ZXCV white keys (CP_WHITE_K) */
     kbd_hline(10, KX, NLO, ACS_ULCORNER, ACS_TTEE, ACS_URCORNER);
 
     attron(COLOR_PAIR(CP_CYAN));
     mvaddch(11, KX, ACS_VLINE);
     attroff(COLOR_PAIR(CP_CYAN));
     for (int i = 0; i < NLO; i++) {
-        attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
-        addch(wht_lo[i]); addch(' ');
-        attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+        char c = blk_lo[i];
+        if (c != ' ') {
+            attron(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
+            addch(c); addch(' ');
+            attroff(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
+        } else {
+            addch(' '); addch(' ');
+        }
         attron(COLOR_PAIR(CP_CYAN));
         addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_CYAN));
@@ -739,14 +906,9 @@ static void draw_keyboard_screen(void)
     mvaddch(13, KX, ACS_VLINE);
     attroff(COLOR_PAIR(CP_CYAN));
     for (int i = 0; i < NLO; i++) {
-        char c = blk_lo[i];
-        if (c != ' ') {
-            attron(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
-            addch(c); addch(' ');
-            attroff(COLOR_PAIR(CP_BLACK_K) | A_BOLD);
-        } else {
-            addch(' '); addch(' ');
-        }
+        attron(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
+        addch(wht_lo[i]); addch(' ');
+        attroff(COLOR_PAIR(CP_WHITE_K) | A_BOLD);
         attron(COLOR_PAIR(CP_CYAN));
         addch(ACS_VLINE);
         attroff(COLOR_PAIR(CP_CYAN));
@@ -765,7 +927,7 @@ static void draw_keyboard_screen(void)
 
     /* ── status bar ── */
     attron(COLOR_PAIR(CP_YELLOW));
-    mvprintw(22, 2, " Play keys above. Hold for sustain. ESC=Quit ");
+    mvprintw(22, 2, " F9=LoadScale  F11=SaveScale  Hold key=sustain  ESC=Quit ");
     attroff(COLOR_PAIR(CP_YELLOW));
 
     refresh();
@@ -865,6 +1027,20 @@ static void run_main_loop(void)
                 else              draw_values_screen();
                 continue;
             }
+            if (ch == KEY_F(9)) {
+                /* F9 – load scale file */
+                ui_load_scale();
+                if (!show_values) draw_keyboard_screen();
+                else              draw_values_screen();
+                continue;
+            }
+            if (ch == KEY_F(11)) {
+                /* F11 – save scale file */
+                ui_save_scale();
+                if (!show_values) draw_keyboard_screen();
+                else              draw_values_screen();
+                continue;
+            }
             if (ch == '\n' || ch == KEY_ENTER || ch == '\r') {
                 show_values = !show_values;
                 if (show_values) draw_values_screen();
@@ -911,12 +1087,26 @@ static void run_main_loop(void)
 }
 
 /* ───────────────────────────────────────── main ── */
-int main(void)
+int main(int argc, char **argv)
 {
+    const char *scale_file = NULL;
+
+    /* parse CLI flags: -s <scale_file> */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
+            scale_file = argv[++i];
+        else {
+            fprintf(stderr, "Usage: %s [-s scale_file]\n", argv[0]);
+            return 1;
+        }
+    }
+
     srand((unsigned)time(NULL));
 
-    build_freq_tables();
-    build_key_map();
+    build_freq_tables();   /* seeds note_raw[] from built-in DATA */
+    build_key_map();       /* must run before load_scale() */
+    if (scale_file)
+        load_scale(scale_file);  /* override note_raw[] + rebuild tables */
     init_alsa();
     init_sid();
     default_patch();
