@@ -108,7 +108,7 @@ static void render_scope(void)
                 int vy = row0 + b;
                 if (vy < SCOPE_PX && px[vy][x] == 1) bits |= (1 << b);
             }
-            SCHAR(bits | 0x3F);
+            SCHAR(bits + 0x3F);  /* sixel char: 0x3F=blank, 0x40=bit0 lit, ... 0x7E=all lit */
         }
         SCHAR('$');   /* carriage return — back to start of this band */
 
@@ -120,7 +120,7 @@ static void render_scope(void)
                 int vy = row0 + b;
                 if (vy < SCOPE_PX && px[vy][x] == 2) bits |= (1 << b);
             }
-            SCHAR(bits | 0x3F);
+            SCHAR(bits + 0x3F);  /* sixel char: 0x3F=blank, 0x40=bit0 lit, ... 0x7E=all lit */
         }
         SCHAR('-');   /* sixel newline — advance to next band         */
     }
