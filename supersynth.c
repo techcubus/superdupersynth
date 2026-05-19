@@ -42,6 +42,7 @@ void *resid_new(void);
 void  resid_free(void *sid);
 void  resid_reset(void *sid);
 int   resid_write(void *sid, int reg, int val);
+int   resid_read(void *sid, int reg);
 void  resid_clock_delta(void *sid, int cycles, short *buf, int *count);
 #ifdef __cplusplus
 }
@@ -136,6 +137,23 @@ static Patch       patch;
 
 /* ncurses ch → note index (0 = not a note key) */
 static int key_to_note[256];
+
+/* ── FL effect state ──
+ * These are advanced each audio_tick() while a note is held (note_active=1).
+ *
+ * FL=1 vibrato: voice 3 runs as a free LFO; each tick we read its oscillator
+ *   output via reSID register 0x1B and write it to voices 1+2 freq LO.
+ *   BASIC line 400: POKEV,PEEK(V+27):POKEV+7,PEEK(V+27)
+ *   V+27 = SID reg 0x1B = voice 3 oscillator output (read-only on real HW).
+ *   reSID exposes this via SID::read(0x1b) → voice[2].wave.readOSC().
+ *   Voice 3's waveform and rate were already written by apply_patch (vs, vi).
+ *
+ * FL=2 filter sweep: FC_HI is stepped from 0 up to patch.sl in increments
+ *   of 10 each tick, then held.
+ *   BASIC line 410: FORU=1TOSLSTEP10:POKEV+22,U
+ */
+static int note_active  = 0;   /* 1 while a note is gated on */
+static int fl_sweep_pos = 0;   /* current FC_HI value for FL=2 sweep */
 
 /* ───────────────────────────────────────── forward decls ── */
 static void build_freq_tables(void);
@@ -360,6 +378,10 @@ static void play_note(int t)
     /* w1/w2 include the gate bit (bit 0); writing them triggers note-on */
     sid_write(V1_CTRL, patch.w1);
     sid_write(V2_CTRL, patch.w2);
+
+    /* reset FL effect state for the new note */
+    note_active  = 1;
+    fl_sweep_pos = 0;
 }
 
 static void release_note(void)
@@ -367,11 +389,59 @@ static void release_note(void)
     sid_write(V1_CTRL, patch.w1 & ~1);   /* clear gate bit */
     sid_write(V2_CTRL, patch.w2 & ~1);
     sid_write(V3_FREQ_HI, 0);            /* BASIC line 430: POKEV+15,0 */
+    sid_write(FC_HI, 0);                 /* reset filter cutoff after sweep */
+    note_active = 0;
+}
+
+/* ───────────────────────────────────────── FL effect tick ── */
+/*
+ * Advance the active FL effect by one audio buffer's worth.
+ * Called once per audio_tick() while note_active is set.
+ *
+ * FL=1 vibrato
+ *   Advance an 8-bit LFO phase accumulator by patch.vi each tick.
+ *   Convert the phase to a waveform value (matching patch.vs shape codes)
+ *   and write it to voices 1+2 freq LO to modulate pitch.
+ *   The BASIC read voice-3 oscillator output for this; we replicate the
+ *   waveform arithmetic directly since reSID doesn't expose that register.
+ *
+ * FL=2 filter sweep
+ *   Step FC_HI up from 0 toward patch.sl in increments of 10, then hold.
+ *   BASIC line 410: FOR U=1 TO SL STEP 10 : POKEV+22,U
+ */
+static void fl_tick(void)
+{
+    if (!note_active) return;
+
+    switch (patch.fl) {
+    case 1: {
+        /* read the real voice 3 oscillator output (SID reg 0x1B).
+         * Voice 3 was set up as a free-running LFO by apply_patch (waveform
+         * = vs, frequency = vi written to V3_FREQ_LO/HI).  reSID clocks the
+         * oscillator inside resid_clock_delta, so each tick produces a fresh
+         * value here — exactly what the BASIC does with PEEK(V+27). */
+        int val = resid_read(sid, 0x1b);
+        /* modulate pitch of voices 1 and 2 by writing to their freq LO bytes */
+        sid_write(V1_FREQ_LO, val);
+        sid_write(V2_FREQ_LO, val);
+        break;
+    }
+    case 2:
+        /* step filter cutoff up to patch.sl then hold */
+        if (fl_sweep_pos < patch.sl) {
+            fl_sweep_pos += 10;
+            if (fl_sweep_pos > patch.sl) fl_sweep_pos = patch.sl;
+            sid_write(FC_HI, fl_sweep_pos);
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 /* ───────────────────────────────────────── audio tick ── */
 /*
- * Clock the SID for AUDIO_FRAMES samples and write to ALSA.
+ * Clock the SID for AUDIO_FRAMES samples, advance FL effects, write to ALSA.
  * Called from the main loop continuously so the SID envelope advances
  * even between key presses.
  */
@@ -381,6 +451,8 @@ static void audio_tick(void)
     /* integer cycles per buffer: SID_CLOCK/SAMPLE_RATE * AUDIO_FRAMES */
     int cycles_per_sample = SID_CLOCK / SAMPLE_RATE;
     int count = AUDIO_FRAMES;
+
+    fl_tick();  /* advance vibrato / filter sweep before clocking */
 
     resid_clock_delta(sid, cycles_per_sample * AUDIO_FRAMES, buf, &count);
 

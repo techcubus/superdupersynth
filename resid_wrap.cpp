@@ -57,6 +57,15 @@ int resid_write(void *sid, int reg, int val)
     return 0;
 }
 
+/* Read a SID register.  Only a few are readable on real hardware:
+ * 0x19 = POT X, 0x1A = POT Y, 0x1B = voice 3 oscillator, 0x1C = voice 3 envelope.
+ * Write-only registers return the last value written (bus capacitance behaviour). */
+int resid_read(void *sid, int reg)
+{
+    SID *s = static_cast<SID *>(sid);
+    return static_cast<int>(s->read(static_cast<reg8>(reg)));
+}
+
 /*
  * Clock the SID for `cycles` cycles and produce `*count` 16-bit samples.
  * On return *count contains the actual number of samples produced.
