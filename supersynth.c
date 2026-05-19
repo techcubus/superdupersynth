@@ -300,19 +300,19 @@ static int adsr_sr(void) { return (patch.su & 0xF) << 4 | (patch.re & 0xF); }
 static void apply_patch(void)
 {
     int ad = adsr_ad(), sr = adsr_sr();
-    sid_write(V1_AD,   ad);
-    sid_write(V1_SR,   sr);
-    sid_write(V2_AD,   ad);
-    sid_write(V2_SR,   sr);
-    /* BASIC: POKEV+3,DB / V+10,DC / V+17,DD  →  PW HI regs */
+    sid_write(V1_AD,    ad);           /* attack/decay for voice 1 */
+    sid_write(V1_SR,    sr);           /* sustain/release for voice 1 */
+    sid_write(V2_AD,    ad);           /* attack/decay for voice 2 */
+    sid_write(V2_SR,    sr);           /* sustain/release for voice 2 */
+    /* BASIC: POKEV+3,DB / V+10,DC / V+17,DD  →  pulse-width HI regs for voices 1-3 */
     sid_write(V1_PW_HI,  patch.db);
     sid_write(V2_PW_HI,  patch.dc);
     sid_write(V3_PW_HI,  patch.dd);
-    sid_write(V3_FREQ_LO, patch.vi);
-    /* BASIC: POKEV+18,VS  →  V3 control register (waveform for LFO voice) */
+    sid_write(V3_FREQ_LO, patch.vi);  /* vibrato LFO speed (voice 3 freq lo) */
+    /* BASIC: POKEV+18,VS  →  V3 control register sets LFO waveform */
     sid_write(V3_CTRL,   patch.vs);
-    sid_write(RES_FILT,  patch.po);
-    sid_write(MODE_VOL,  patch.vo);
+    sid_write(RES_FILT,  patch.po);   /* resonance and filter routing */
+    sid_write(MODE_VOL,  patch.vo);   /* filter mode and master volume */
 }
 
 /* ───────────────────────────────────────── note on/off ── */
@@ -352,6 +352,7 @@ static void play_note(int t)
         break;
     }
 
+    /* w1/w2 include the gate bit (bit 0); writing them triggers note-on */
     sid_write(V1_CTRL, patch.w1);
     sid_write(V2_CTRL, patch.w2);
 }
@@ -372,6 +373,7 @@ static void release_note(void)
 static void audio_tick(void)
 {
     static short buf[AUDIO_FRAMES];
+    /* integer cycles per buffer: SID_CLOCK/SAMPLE_RATE * AUDIO_FRAMES */
     int cycles_per_sample = SID_CLOCK / SAMPLE_RATE;
     int count = AUDIO_FRAMES;
 
@@ -379,17 +381,22 @@ static void audio_tick(void)
 
     int written = snd_pcm_writei(pcm, buf, count);
     if (written == -EPIPE) {
+        /* underrun — reset PCM state and continue */
         snd_pcm_prepare(pcm);
     }
+    /* -EAGAIN (buffer full, non-blocking) is silently dropped; the SID
+     * envelope still advances even if this buffer doesn't reach the speaker */
 }
 
 /* ───────────────────────────────────────── randomise patch ── */
 static void randomise_patch(void)
 {
+    /* waveform control bytes: triangle=17, sawtooth=33, pulse=65, noise=129,
+     * tri+pulse=21, saw+pulse=23, all=85  (gate bit not included here) */
     static const int waveforms[] = {17,33,65,129,21,23,85};
-    static const int vols[]      = {31,45,79};
-    static const int vs_vals[]   = {17,33,65,129};
-    static const int po_vals[]   = {240,241,242,243};
+    static const int vols[]      = {31,45,79};    /* low-pass=31, band=45, high=79 */
+    static const int vs_vals[]   = {17,33,65,129};/* LFO waveform shapes */
+    static const int po_vals[]   = {240,241,242,243}; /* resonance/filter routing */
 
     patch.z   = (rand() % 6) + 1;
     patch.fl  = rand() % 3;
@@ -730,7 +737,19 @@ static void draw_values_screen(void)
 static void run_main_loop(void)
 {
     int  show_values  = 0;
-    int  current_note = 0;    /* 0 = no note active */
+    int  current_note = 0;             /* note index currently gated on, 0 = none */
+    struct timespec last_key_ts = {0, 0}; /* time of last note-key event */
+
+    /*
+     * Terminal key-up workaround: ncurses has no key-up events.
+     * We timestamp every note-key event (including repeat, ~30ms apart).
+     * If no event arrives for RELEASE_MS, assume key was released and gate off.
+     * 120ms sits comfortably above typical key-repeat interval (~30ms) while
+     * staying short enough to feel responsive. The 500ms initial-repeat delay
+     * means notes get cut off if held between ~120ms and ~500ms — accepted
+     * limitation until MIDI input replaces keyboard.
+     */
+#define RELEASE_MS 120L
 
     draw_keyboard_screen();
 
@@ -758,14 +777,14 @@ static void run_main_loop(void)
                 /* F5 – save patch */
                 save_patch();
                 if (!show_values) draw_keyboard_screen();
-                else             draw_values_screen();
+                else              draw_values_screen();
                 continue;
             }
             if (ch == KEY_F(7)) {
                 /* F7 – load patch */
                 load_patch();
                 if (!show_values) draw_keyboard_screen();
-                else             draw_values_screen();
+                else              draw_values_screen();
                 continue;
             }
             if (ch == '\n' || ch == KEY_ENTER || ch == '\r') {
@@ -776,6 +795,7 @@ static void run_main_loop(void)
             }
             if (ch == 27 /* ESC */) {
                 release_note();
+                current_note = 0;
                 break;
             }
 
@@ -785,6 +805,7 @@ static void run_main_loop(void)
             if (ch >= 0 && ch < 256) {
                 int note = key_to_note[ch];
                 if (note > 0) {
+                    clock_gettime(CLOCK_MONOTONIC, &last_key_ts);
                     if (current_note != note) {
                         release_note();
                         current_note = note;
@@ -792,14 +813,23 @@ static void run_main_loop(void)
                     }
                 }
             }
-        } else {
-            /* No key – if a note was being held, check nothing new came in */
-            /* (ncurses getch timeout keeps us responsive)                   */
         }
 
-        /* Push audio every iteration */
+        /* Gate off if no note-key event for RELEASE_MS */
+        if (current_note > 0 && last_key_ts.tv_sec > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long ms = (now.tv_sec  - last_key_ts.tv_sec)  * 1000L
+                    + (now.tv_nsec - last_key_ts.tv_nsec) / 1000000L;
+            if (ms >= RELEASE_MS) {
+                release_note();
+                current_note = 0;
+            }
+        }
+
         audio_tick();
     }
+#undef RELEASE_MS
 }
 
 /* ───────────────────────────────────────── main ── */
