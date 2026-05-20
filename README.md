@@ -20,7 +20,7 @@ to make sound.
 Only tested on Debian/Ubuntu.  The reSID package names are confusing:
 
 ```bash
-sudo apt install libncurses-dev libasound2-dev libresid-builder-dev libsidplay2-dev
+sudo apt install libasound2-dev libresid-builder-dev libsidplay2-dev
 ```
 
 - `libresid-builder-dev` provides the shared library (`-lresid-builder`)
@@ -28,6 +28,7 @@ sudo apt install libncurses-dev libasound2-dev libresid-builder-dev libsidplay2-
 - Both come from sidplay-libs 2.1.1 — **versions must match**
 - Do **not** use `libresid-dev` (does not exist on modern systems) or
   `libsidplayfp-dev` (incompatible fork)
+- **ncurses is no longer required** — the UI uses raw ANSI/Unicode directly
 
 If headers or libs are in a non-standard path, edit `Makefile` and
 uncomment the `RESID_INC` / `RESID_LIB` lines.
