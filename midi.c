@@ -32,19 +32,20 @@ static void *midi_thread_fn(void *arg)
     snd_seq_event_t *ev;
     struct pollfd    pfd;
 
-    /* get the poll descriptor for reading; one fd is enough for our port */
+    /* non-blocking so the drain loop exits with -EAGAIN rather than blocking */
+    snd_seq_nonblock(s, 1);
     snd_seq_poll_descriptors(s, &pfd, 1, POLLIN);
 
     while (!midi_stop) {
-        /* poll with a short timeout so we wake up regularly to check midi_stop */
+        /* short timeout so we wake up and recheck midi_stop even when idle */
         int r = poll(&pfd, 1, 50);
         if (r < 0) break;
-        if (r == 0) continue;   /* timeout — go back and check midi_stop */
+        if (r == 0) continue;   /* timeout — loop back to check midi_stop */
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
 
-        /* drain all pending events in one burst */
-        while (snd_seq_event_input_pending(s, 0) > 0) {
-            if (snd_seq_event_input(s, &ev) < 0) goto done;
+        /* drain all available events; -EAGAIN signals the buffer is empty */
+        int rc;
+        while ((rc = snd_seq_event_input(s, &ev)) >= 0) {
             switch (ev->type) {
             case SND_SEQ_EVENT_NOTEON:
                 if (ev->data.note.velocity > 0) {
@@ -61,8 +62,8 @@ static void *midi_thread_fn(void *arg)
                 break;
             }
         }
+        if (rc != -EAGAIN) break;   /* real error, not just empty buffer */
     }
-done:
     return NULL;
 }
 
