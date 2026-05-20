@@ -56,6 +56,10 @@ static volatile int  beat_in_bar   = 0;   /* 0 .. BEATS_PER_BAR-1   */
 static volatile int  bar           = 0;   /* 0-based bar count       */
 static volatile int  step          = 0;   /* 0-based 16th-note step  */
 
+/* jitter stats — how late each clock_nanosleep wakeup was vs intended */
+static volatile long jitter_last_us = 0;   /* most recent wakeup error (µs) */
+static volatile long jitter_max_us  = 0;   /* worst case since last START   */
+
 /* ── ALSA handles ───────────────────────────────────────────────── */
 static snd_seq_t *seq      = NULL;
 static int        out_port = -1;
@@ -93,6 +97,15 @@ static void *clock_thread_fn(void *arg)
         }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
 
+        /* measure how late we actually woke up vs the intended time */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long late_us = (now.tv_sec  - next.tv_sec)  * 1000000L
+                     + (now.tv_nsec - next.tv_nsec) / 1000L;
+        if (late_us < 0) late_us = 0;   /* can be slightly negative: fine */
+        jitter_last_us = late_us;
+        if (late_us > jitter_max_us) jitter_max_us = late_us;
+
         if (!running) continue;
 
         send_rt_event(SND_SEQ_EVENT_CLOCK);
@@ -119,11 +132,12 @@ static void transport_start(void)
 {
     /* reset position counters before setting running so the clock
      * thread never sees a partial reset */
-    tick_in_beat = 0;
-    beat_in_bar  = 0;
-    bar          = 0;
-    step         = 0;
-    running      = 1;
+    tick_in_beat   = 0;
+    beat_in_bar    = 0;
+    bar            = 0;
+    step           = 0;
+    jitter_max_us  = 0;
+    running        = 1;
     send_rt_event(SND_SEQ_EVENT_START);
 }
 
@@ -163,8 +177,9 @@ static void draw_header(void)
     printf("\n");   /* line 3: BPM     */
     printf("\n");   /* line 4: state   */
     printf("\n");   /* line 5: pos     */
-    printf("\n");   /* line 6: step    */
-    printf("\n");   /* line 7: blank   */
+    printf("\n");   /* line 6: beat    */
+    printf("\n");   /* line 7: jitter  */
+    printf("\n");   /* line 8: blank   */
     printf(COL_DIM " SPACE=start/stop  c=continue"
                    "  +/-=bpm  </>=bpm±5  q=quit" COL_RESET "\n");
     fflush(stdout);
@@ -184,6 +199,11 @@ static void draw_state(void)
     /* position — line 5 */
     printf("\033[5;1H" COL_DIM " Bar %-4d  Beat %d  Tick %02d" COL_RESET "   ",
            bar + 1, beat_in_bar + 1, tick_in_beat);
+
+    /* jitter — line 7 */
+    printf("\033[7;1H" COL_DIM " Jitter:  last " COL_RESET
+           "%4ld µs   " COL_DIM "worst " COL_RESET "%4ld µs      ",
+           jitter_last_us, jitter_max_us);
 
     /* beat pulse indicator — line 6 */
     printf("\033[6;1H  %s  %s  %s  %s",
