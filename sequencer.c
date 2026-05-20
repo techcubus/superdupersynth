@@ -229,7 +229,7 @@ static void draw_status(void)
     int row = ROW_GRID + NUM_TRACKS * 2 + 1;
     termw_move(row, COL_MARGIN);
     printf(TW_DIM " Oct:%d  T%d:Step%02d  "
-           "[arrows=nav  PgUp/Dn=page  [/]=oct"
+           "[arrows=nav  PgUp/Dn=page  [/]=oct  -/+=note oct"
            "  a=accent  s=slide  d=rest  f=tie  ESC=quit]"
            TW_RESET,
            entry_octave, cursor_track + 1, cursor_step + 1);
@@ -349,6 +349,12 @@ int main(void)
                 pat.steps[cursor_track][cursor_step].tie    = 0;
             } else if (ch == 'f') {
                 pat.steps[cursor_track][cursor_step].tie ^= 1;
+            } else if (ch == '-') {
+                int *n = &pat.steps[cursor_track][cursor_step].note;
+                if (*n >= 12) *n -= 12;
+            } else if (ch == '=') {
+                int *n = &pat.steps[cursor_track][cursor_step].note;
+                if (*n >= 0 && *n <= 115) *n += 12;
             }
         }
 
