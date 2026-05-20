@@ -1,33 +1,33 @@
 /*
  * patchbrowser.c — modal patch file browser for superdupersynth.
  *
- * Layout (80×24 terminal):
+ * Two separate UIs share this file:
  *
+ * LOAD BROWSER (patchbrowser_open_load) — full 80×24 grid:
  *   Row  0     ╔══ border ══╗
- *   Row  1     ║ title + mode + current path ║
+ *   Row  1     ║ LOAD PATCH  patches/current/path ║
  *   Row  2     ╠══ separator ══╣
  *   Rows 3-16  ║ two-column file grid (14 rows × 2 cols = 28 entries) ║
  *   Row 17     ╠══ separator ══╣
- *   Row 18     ║ NAME: ...  AUTHOR: ...  ║
- *   Row 19     ║ COMMENT: ...           ║
- *   Row 20     ║ patch values line 1    ║
- *   Row 21     ║ patch values line 2    ║
+ *   Rows 18-21 ║ preview: NAME / AUTHOR / COMMENT + param values ║
  *   Row 22     ╠══ separator ══╣
  *   Row 23     ║ key hints ║
+ *   Keys: ↑↓←→ nav, ENTER=open/load, N=new dir, ESC=cancel
  *
- * Navigation:
- *   ↑ ↓        move cursor one row (2 entries) in current column
- *   ← →        switch column on same row
- *   ENTER       enter directory / load file (load mode)
- *               enter directory (save mode)
- *   S           save patch to current directory (save mode only)
- *   N           create new directory in current directory
- *   ESC         cancel / close browser
+ * SAVE DIALOG (patchbrowser_open_save) — streamlined modal:
+ *   Row 4  Filename field
+ *   Row 6  Bank field (TAB opens bank picker popup)
+ *   Rows 8-16  bank picker popup (when open)
+ *   Row 17 separator (shows CONFLICT label when conflict exists)
+ *   Rows 18-21 conflict preview
+ *   Row 23 hints
+ *   Keys: TAB=bank picker, ENTER=save, ESC=cancel; Y/N when conflict shown
  *
  * File formats:
- *   .pjs       Preferred — carries name, author, comment metadata.
- *   anything    Legacy — 17 integers one per line; all values are
- *               range-clamped on read.
+ *   .pjs       Rich format — carries name, author, comment metadata.
+ *              Default for all saves; extension appended automatically.
+ *   anything   Legacy — 17 integers one per line (original C64 BASIC save
+ *              convention).  Values are range-clamped on load.
  */
 
 #define _GNU_SOURCE
@@ -54,6 +54,7 @@
 /* ── storage ─────────────────────────────────────────────────────── */
 #define MAX_ENTRIES  512
 #define NAME_MAX_LEN 256
+#define MAX_BANKS     64   /* max bank directories listed in save popup */
 
 typedef struct {
     char name[NAME_MAX_LEN];
@@ -68,9 +69,9 @@ static int   num_entries = 0;
 static int   cursor      = 0;
 static int   scroll      = 0;    /* first visible grid row */
 
-/* ── mode ────────────────────────────────────────────────────────── */
-typedef enum { PB_LOAD, PB_SAVE } PBMode;
-static PBMode mode;
+/* ── bank list (used by save dialog) ─────────────────────────────── */
+static char sd_banks[MAX_BANKS][NAME_MAX_LEN];
+static int  sd_nbanks;
 
 /* ═══════════════════════════════════ path utilities ═════════════ */
 
@@ -193,6 +194,35 @@ static void scan_dir(void)
     /* sort the real entries; leave the synthetic ".." at index 0 */
     if (num_entries - base > 1)
         qsort(entries + base, num_entries - base, sizeof(Entry), entry_cmp);
+}
+
+/*
+ * Scan patches_root for subdirectories and populate sd_banks[].
+ * Called at the start of each save_dialog() invocation.
+ */
+static void scan_banks(void)
+{
+    sd_nbanks = 0;
+    DIR *d = opendir(patches_root);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) && sd_nbanks < MAX_BANKS) {
+        if (de->d_name[0] == '.') continue;
+        int is_dir = 0;
+        if (de->d_type == DT_DIR) {
+            is_dir = 1;
+        } else if (de->d_type == DT_UNKNOWN) {
+            char p[PATH_BUF];
+            snprintf(p, sizeof(p), "%s/%s", patches_root, de->d_name);
+            struct stat st;
+            is_dir = (stat(p, &st) == 0 && S_ISDIR(st.st_mode));
+        }
+        if (!is_dir) continue;
+        snprintf(sd_banks[sd_nbanks++], NAME_MAX_LEN, "%s", de->d_name);
+    }
+    closedir(d);
+    qsort(sd_banks, sd_nbanks, NAME_MAX_LEN,
+          (int (*)(const void *, const void *))strcmp);
 }
 
 /* ═══════════════════════════════════ JSON helpers ═══════════════ */
@@ -464,19 +494,14 @@ static void draw_chrome(void)
     printf("╠");  for (int c = 1; c < 79; c++) printf("═");  printf("╣");
     printf(TW_RESET);
 
-    /* title: mode + path */
+    /* title + current path */
     termw_move(1, 2);
-    printf(TW_BOLD "%s" TW_RESET "  " TW_CYAN "patches/%s" TW_RESET,
-           mode == PB_LOAD ? "LOAD PATCH" : "SAVE PATCH",
+    printf(TW_BOLD "LOAD PATCH" TW_RESET "  " TW_CYAN "patches/%s" TW_RESET,
            rel_path);
 
     /* hints */
     termw_move(23, 2);
-    if (mode == PB_LOAD) {
-        printf(TW_DIM "↑↓←→ nav  ENTER=open/load  N=new dir  ESC=cancel" TW_RESET);
-    } else {
-        printf(TW_DIM "↑↓←→ nav  ENTER=open dir  S=save here  N=new dir  ESC=cancel" TW_RESET);
-    }
+    printf(TW_DIM "↑↓←→ nav  ENTER=open/load  N=new dir  ESC=cancel" TW_RESET);
 }
 
 /*
@@ -659,56 +684,432 @@ static void pb_prompt(int row, int col, const char *prompt, char *buf, int maxle
     termw_cursor_hide();
 }
 
-/* ═══════════════════════════════════ save flow ══════════════════ */
+/* ═══════════════════════════════════ save dialog ══════════════════
+ *
+ * A standalone modal dialog — nothing to do with the load browser.
+ *
+ * Layout (full 80×24):
+ *   Row 0     ╔═══ border ═══╗
+ *   Row 1     ║ SAVE PATCH   ║
+ *   Row 2     ╠══════════════╣
+ *   Row 4     ║  Filename: [___] ║
+ *   Row 6     ║  Bank:     [___] ║
+ *   Rows 8-15  bank popup (when open)
+ *   Row 17    ╠══════════════╣  (shows ═ CONFLICT label if conflict)
+ *   Rows18-21  conflict preview (when conflict exists)
+ *   Row 22    ╠══════════════╣
+ *   Row 23    ║ hints ║
+ *
+ * States: 0=editing filename, 1=bank popup open, 2=confirming overwrite.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Save-dialog layout constants (separate from the load browser). */
+#define SD_ROW_FNAME   4
+#define SD_ROW_BANK    6
+#define SD_ROW_POPBOX  7    /* top border of popup box */
+#define SD_ROW_POPTOP  8    /* first entry row */
+#define SD_ROW_SEP    17    /* separator above preview / conflict */
+#define SD_ROW_PREV   18
+#define SD_ROW_HINT   23
+#define SD_POPUP_L     3    /* popup left column */
+#define SD_POPUP_R    62    /* popup right column */
+#define SD_POP_INNER  (SD_POPUP_R - SD_POPUP_L - 2)   /* inner width */
+#define POPUP_MAX_VIS  7    /* max entries visible at once */
 
 /*
- * Run the interactive save flow: prompt for filename and metadata in the
- * preview area, then write the JSON file.  Rescans the directory on success.
- * Returns 1 if saved, 0 if cancelled at any prompt.
+ * Fill popup_idx[] with entries matching 'filter' (case-insensitive prefix).
+ * popup_idx[0] is always -1 (the "(root)" synthetic entry).
+ * Matching bank indices from sd_banks[] follow.
+ * Returns the total count.
  */
-static int do_save(const Patch *p)
+static int filter_banks(const char *filter, int *popup_idx, int max)
 {
-    char fname[64]    = "";
-    char name[64]     = "";
-    char author[64]   = "";
-    char comment[128] = "";
+    popup_idx[0] = -1;   /* (root) is always present */
+    int n = 1;
+    size_t flen = strlen(filter);
+    for (int i = 0; i < sd_nbanks && n < max; i++) {
+        if (!flen || strncasecmp(sd_banks[i], filter, flen) == 0)
+            popup_idx[n++] = i;
+    }
+    return n;
+}
 
-    /* clear preview rows for prompt display */
-    for (int r = ROW_PREVIEW; r < ROW_PREVIEW + 4; r++) {
+/* Draw the outer save-dialog chrome (borders + static labels). */
+static void draw_save_chrome(void)
+{
+    termw_clear();
+    printf(TW_CYAN);
+    termw_move(0, 0);
+    printf("╔"); for (int c = 1; c < 79; c++) printf("═"); printf("╗");
+    for (int r = 1; r < 22; r++) {
+        termw_move(r,  0); printf("║");
+        termw_move(r, 79); printf("║");
+    }
+    termw_move(SD_ROW_SEP, 0);
+    printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
+    termw_move(22, 0);
+    printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
+    termw_move(23, 0); printf("║"); termw_move(23, 79); printf("║");
+    printf(TW_RESET);
+
+    termw_move(1, 2);
+    printf(TW_BOLD "SAVE PATCH" TW_RESET);
+
+    /* field labels */
+    termw_move(SD_ROW_FNAME, 2);
+    printf(TW_BOLD "Filename:" TW_RESET);
+    termw_move(SD_ROW_BANK, 2);
+    printf(TW_BOLD "Bank:    " TW_RESET);
+}
+
+/* Redraw the filename and bank field values.
+ * *_active flags add reverse-video to show which field has focus. */
+static void draw_sd_fields(const char *fname, const char *bank,
+                            int fname_active, int bank_active)
+{
+    termw_move(SD_ROW_FNAME, 12);
+    if (fname_active) printf(TW_REVERSE);
+    printf("%-50s", fname);
+    if (fname_active) printf(TW_RESET);
+
+    termw_move(SD_ROW_BANK, 12);
+    if (bank_active) printf(TW_REVERSE);
+    if (bank[0])
+        printf("%-50s", bank);
+    else
+        printf(TW_DIM "(root)%-44s" TW_RESET, "");
+    if (bank_active) printf(TW_RESET);
+}
+
+/*
+ * Draw the bank picker popup box (rows SD_ROW_POPBOX to SD_ROW_SEP-1).
+ * popup_idx[0..n-1]: entry indices (-1=root, else sd_banks[i]).
+ * popup_sel: highlighted entry.
+ * filter: shown in the top border as a reminder of what was typed.
+ */
+static void draw_popup(const int *popup_idx, int popup_n, int popup_sel,
+                       const char *filter)
+{
+    /* scroll window so popup_sel stays visible */
+    int vis_start = popup_sel - POPUP_MAX_VIS / 2;
+    if (vis_start > popup_n - POPUP_MAX_VIS) vis_start = popup_n - POPUP_MAX_VIS;
+    if (vis_start < 0) vis_start = 0;
+    int vis_end = vis_start + POPUP_MAX_VIS;
+    if (vis_end > popup_n) vis_end = popup_n;
+
+    /* top border */
+    termw_move(SD_ROW_POPBOX, SD_POPUP_L);
+    printf("┌"); for (int c = 0; c < SD_POP_INNER; c++) printf("─"); printf("┐");
+
+    /* filter hint inside the top border */
+    if (filter[0]) {
+        termw_move(SD_ROW_POPBOX, SD_POPUP_L + 2);
+        printf(TW_CYAN " %.*s " TW_RESET, SD_POP_INNER - 4, filter);
+    }
+
+    /* entry rows */
+    int row = SD_ROW_POPTOP;
+    for (int i = vis_start; i < vis_end; i++, row++) {
+        const char *label = (popup_idx[i] < 0) ? "(root)" : sd_banks[popup_idx[i]];
+        termw_move(row, SD_POPUP_L);
+        if (i == popup_sel)
+            printf("│" TW_REVERSE TW_BOLD " > %-*.*s " TW_RESET "│",
+                   SD_POP_INNER - 4, SD_POP_INNER - 4, label);
+        else
+            printf("│   %-*.*s │", SD_POP_INNER - 4, SD_POP_INNER - 4, label);
+    }
+
+    /* blank any remaining rows between entries and separator */
+    for (; row < SD_ROW_SEP - 1; row++) {
+        termw_move(row, SD_POPUP_L);
+        printf("│%-*s│", SD_POP_INNER, "");
+    }
+
+    /* bottom border */
+    termw_move(SD_ROW_SEP - 1, SD_POPUP_L);
+    printf("└"); for (int c = 0; c < SD_POP_INNER; c++) printf("─"); printf("┘");
+}
+
+/* Erase the popup area. */
+static void clear_popup_area(void)
+{
+    for (int r = SD_ROW_POPBOX; r < SD_ROW_SEP; r++) {
         termw_move(r, 1); printf("%-77s", "");
     }
+}
 
-    pb_prompt(ROW_PREVIEW,     2, "Filename (no ext): ", fname,   62);
-    if (!fname[0]) return 0;
-
-    pb_prompt(ROW_PREVIEW + 1, 2, "Name:              ", name,    62);
-    if (!name[0]) return 0;
-
-    pb_prompt(ROW_PREVIEW + 2, 2, "Author:            ", author,  62);
-    /* author is optional — don't cancel on empty */
-
-    pb_prompt(ROW_PREVIEW + 3, 2, "Comment:           ", comment, 126);
-    /* comment is optional too */
-
-    /* build the full path: current dir / filename.pjs */
-    char path[EPATH_BUF];
-    {
-        char dir[PATH_BUF];
-        full_path(dir, sizeof(dir));
-        snprintf(path, sizeof(path), "%s/%s.pjs", dir, fname);
+/* Draw the conflict preview for an existing .pjs file at 'path'.
+ * display_name is used as the NAME field if the file has an empty name. */
+static void draw_sd_conflict(const char *path, const char *display_name)
+{
+    for (int r = SD_ROW_PREV; r < SD_ROW_PREV + 4; r++) {
+        termw_move(r, 1); printf("%-77s", "");
     }
+    Patch tmp;
+    char  name[64] = "", author[64] = "", comment[128] = "";
+    if (load_json(path, &tmp, name, author, comment) < 0) return;
 
-    if (save_json(path, p, name, author, comment) < 0) {
-        /* write failed — show error in preview row and wait for a key */
-        termw_move(ROW_PREVIEW, 2);
-        printf(TW_RED TW_BOLD "ERROR: could not write file." TW_RESET);
-        termw_flush();
-        termw_read_key();
-        return 0;
+    /* annotate the separator */
+    termw_move(SD_ROW_SEP, 1);
+    printf(TW_BOLD TW_YELLOW " CONFLICT " TW_RESET);
+
+    termw_move(SD_ROW_PREV, 2);
+    printf(TW_BOLD "NAME:   " TW_RESET "%-30.30s  "
+           TW_BOLD "AUTHOR: " TW_RESET "%.26s",
+           name[0] ? name : display_name, author);
+    termw_move(SD_ROW_PREV + 1, 2);
+    printf(TW_BOLD "COMMENT:" TW_RESET " %.66s", comment);
+    termw_move(SD_ROW_PREV + 2, 2);
+    printf(TW_DIM "Z:%-2d FL:%d  W1:%-3d W2:%-3d  AT:%-2d DE:%-2d SU:%-2d RE:%-2d" TW_RESET,
+           tmp.z, tmp.fl, tmp.w1, tmp.w2, tmp.at, tmp.de, tmp.su, tmp.re);
+    termw_move(SD_ROW_PREV + 3, 2);
+    printf(TW_DIM "PO:%-3d XT:%-3d VI:%-3d VS:%-3d  DB:%-3d DC:%-3d DD:%-3d VO:%-3d SL:%-3d" TW_RESET,
+           tmp.po, tmp.xt, tmp.vi, tmp.vs, tmp.db, tmp.dc, tmp.dd, tmp.vo, tmp.sl);
+}
+
+/* Clear the conflict preview and restore the plain separator line. */
+static void clear_sd_conflict(void)
+{
+    for (int r = SD_ROW_PREV; r < SD_ROW_PREV + 4; r++) {
+        termw_move(r, 1); printf("%-77s", "");
     }
+    termw_move(SD_ROW_SEP, 1); printf("%-77s", "");
+}
 
-    scan_dir();
-    return 1;
+/*
+ * Standalone save dialog.  Returns 1 if the patch was written, 0 if cancelled.
+ *
+ * The user fills in a filename, optionally picks a bank (subdirectory of
+ * patches/), and presses Enter.  On a name conflict the existing patch is
+ * previewed and the user must confirm before overwriting.
+ *
+ * The .pjs extension is always appended automatically.
+ * Bank names that collide with existing regular files are rejected.
+ */
+static int save_dialog(const Patch *p)
+{
+    scan_banks();
+
+    char fname[64]  = "";   /* filename without extension */
+    char bank[64]   = "";   /* selected bank; empty = save to patches root */
+    int  fname_len  = 0;
+    int  state      = 0;    /* 0=fname, 1=popup, 2=confirm overwrite */
+
+    /* popup state */
+    char pop_filter[64] = "";
+    int  pop_len        = 0;
+    int  popup_idx[MAX_BANKS + 1];
+    int  popup_n        = 0;
+    int  popup_sel      = 0;
+
+    /* path to conflicting file (set when state==2) */
+    char conflict_path[EPATH_BUF] = "";
+
+    draw_save_chrome();
+    draw_sd_fields(fname, bank, 1, 0);
+    termw_move(SD_ROW_HINT, 2);
+    printf(TW_DIM "TAB=bank picker  ENTER=save  ESC=cancel" TW_RESET);
+    termw_cursor_show();
+    termw_move(SD_ROW_FNAME, 12);
+    termw_flush();
+
+    for (;;) {
+        int ch = termw_read_key();
+
+        /* ── state 0: editing filename ─────────────────────────── */
+        if (state == 0) {
+            if (ch == TK_ESC) {
+                termw_cursor_hide();
+                return 0;
+            }
+
+            if (ch == TK_TAB || ch == TK_DOWN) {
+                /* open bank popup, pre-seeded from current bank field */
+                state = 1;
+                snprintf(pop_filter, sizeof(pop_filter), "%s", bank);
+                pop_len   = (int)strlen(pop_filter);
+                popup_n   = filter_banks(pop_filter, popup_idx, MAX_BANKS + 1);
+                popup_sel = 0;
+                /* pre-select the entry matching the current bank */
+                for (int i = 0; i < popup_n; i++) {
+                    int bi = popup_idx[i];
+                    const char *lbl = (bi < 0) ? "" : sd_banks[bi];
+                    if (strcmp(lbl, bank) == 0) { popup_sel = i; break; }
+                }
+                draw_sd_fields(fname, bank, 0, 1);
+                draw_popup(popup_idx, popup_n, popup_sel, pop_filter);
+                termw_flush();
+                continue;
+            }
+
+            if (ch == TK_ENTER || ch == '\r') {
+                if (!fname[0]) continue;
+
+                /* build target directory path */
+                char dir[PATH_BUF];
+                if (bank[0])
+                    snprintf(dir, sizeof(dir), "%s/%s", patches_root, bank);
+                else
+                    snprintf(dir, sizeof(dir), "%s", patches_root);
+
+                /* reject bank if something with that name exists as a file */
+                if (bank[0]) {
+                    struct stat st;
+                    if (stat(dir, &st) == 0 && !S_ISDIR(st.st_mode)) {
+                        termw_move(SD_ROW_PREV, 2);
+                        printf(TW_RED TW_BOLD
+                               "ERROR: \"%s\" is a file, not a bank." TW_RESET,
+                               bank);
+                        termw_flush();
+                        termw_read_key();
+                        termw_move(SD_ROW_PREV, 2); printf("%-76s", "");
+                        termw_move(SD_ROW_FNAME, 12 + fname_len);
+                        termw_flush();
+                        continue;
+                    }
+                }
+
+                snprintf(conflict_path, sizeof(conflict_path),
+                         "%s/%s.pjs", dir, fname);
+
+                struct stat st;
+                if (stat(conflict_path, &st) == 0) {
+                    /* conflict — show preview and ask for confirmation */
+                    state = 2;
+                    draw_sd_conflict(conflict_path, fname);
+                    termw_move(SD_ROW_HINT, 2); printf("%-76s", "");
+                    termw_move(SD_ROW_HINT, 2);
+                    printf(TW_YELLOW TW_BOLD
+                           "Y=overwrite  N/ESC=cancel" TW_RESET);
+                    termw_move(SD_ROW_FNAME, 12 + fname_len);
+                    termw_flush();
+                } else {
+                    /* no conflict — create bank dir if new, then save */
+                    if (bank[0]) mkdir(dir, 0755);
+                    if (save_json(conflict_path, p, "", "", "") < 0) {
+                        termw_move(SD_ROW_PREV, 2);
+                        printf(TW_RED TW_BOLD
+                               "ERROR: could not write file." TW_RESET);
+                        termw_flush();
+                        termw_read_key();
+                    }
+                    termw_cursor_hide();
+                    return 1;
+                }
+                continue;
+            }
+
+            /* filename character editing */
+            if ((ch == TK_BACKSPACE || ch == 127) && fname_len > 0) {
+                fname[--fname_len] = '\0';
+            } else if (ch >= 32 && ch < 127 && ch != '/'
+                       && fname_len < (int)sizeof(fname) - 1) {
+                fname[fname_len++] = (char)ch;
+                fname[fname_len]   = '\0';
+            } else {
+                continue;
+            }
+            draw_sd_fields(fname, bank, 1, 0);
+            termw_move(SD_ROW_FNAME, 12 + fname_len);
+            termw_flush();
+        }
+
+        /* ── state 1: bank popup ────────────────────────────────── */
+        else if (state == 1) {
+            if (ch == TK_ESC) {
+                /* discard changes, restore previous bank, back to fname */
+                state = 0;
+                clear_popup_area();
+                draw_sd_fields(fname, bank, 1, 0);
+                termw_move(SD_ROW_FNAME, 12 + fname_len);
+                termw_flush();
+                continue;
+            }
+
+            if (ch == TK_ENTER || ch == '\r' || ch == TK_TAB) {
+                /* confirm bank.
+                 * If filter text is non-empty and exactly matches an existing
+                 * bank, use that.  If it doesn't match any bank, it names a new
+                 * bank to be created on save.  If filter is empty, use the
+                 * highlighted entry (could be root). */
+                if (pop_filter[0]) {
+                    int exact = -1;
+                    for (int i = 0; i < sd_nbanks; i++) {
+                        if (strcasecmp(sd_banks[i], pop_filter) == 0) {
+                            exact = i; break;
+                        }
+                    }
+                    if (exact >= 0)
+                        snprintf(bank, sizeof(bank), "%s", sd_banks[exact]);
+                    else
+                        snprintf(bank, sizeof(bank), "%s", pop_filter); /* new */
+                } else {
+                    int bi = (popup_n > 0) ? popup_idx[popup_sel] : -1;
+                    if (bi < 0) bank[0] = '\0';
+                    else snprintf(bank, sizeof(bank), "%s", sd_banks[bi]);
+                }
+                state = 0;
+                clear_popup_area();
+                draw_sd_fields(fname, bank, 1, 0);
+                termw_move(SD_ROW_FNAME, 12 + fname_len);
+                termw_flush();
+                continue;
+            }
+
+            if (ch == TK_UP) {
+                if (popup_sel > 0) popup_sel--;
+            } else if (ch == TK_DOWN) {
+                if (popup_sel < popup_n - 1) popup_sel++;
+            } else if ((ch == TK_BACKSPACE || ch == 127) && pop_len > 0) {
+                pop_filter[--pop_len] = '\0';
+                popup_n = filter_banks(pop_filter, popup_idx, MAX_BANKS + 1);
+                if (popup_sel >= popup_n) popup_sel = popup_n - 1;
+            } else if (ch >= 32 && ch < 127 && ch != '/'
+                       && pop_len < (int)sizeof(pop_filter) - 1) {
+                pop_filter[pop_len++] = (char)ch;
+                pop_filter[pop_len]   = '\0';
+                popup_n = filter_banks(pop_filter, popup_idx, MAX_BANKS + 1);
+                /* keep sel in range; bias toward first entry on new filter */
+                if (popup_sel >= popup_n) popup_sel = popup_n - 1;
+            } else {
+                continue;
+            }
+
+            draw_popup(popup_idx, popup_n, popup_sel, pop_filter);
+            termw_flush();
+        }
+
+        /* ── state 2: confirm overwrite ─────────────────────────── */
+        else if (state == 2) {
+            if (ch == 'y' || ch == 'Y') {
+                char dir[PATH_BUF];
+                if (bank[0])
+                    snprintf(dir, sizeof(dir), "%s/%s", patches_root, bank);
+                else
+                    snprintf(dir, sizeof(dir), "%s", patches_root);
+                if (bank[0]) mkdir(dir, 0755);
+                if (save_json(conflict_path, p, "", "", "") < 0) {
+                    termw_move(SD_ROW_PREV, 2);
+                    printf(TW_RED TW_BOLD "ERROR: could not write file." TW_RESET);
+                    termw_flush();
+                    termw_read_key();
+                }
+                termw_cursor_hide();
+                return 1;
+            } else {
+                /* any other key — back to filename editing */
+                state = 0;
+                conflict_path[0] = '\0';
+                clear_sd_conflict();
+                termw_move(SD_ROW_HINT, 2); printf("%-76s", "");
+                termw_move(SD_ROW_HINT, 2);
+                printf(TW_DIM "TAB=bank picker  ENTER=save  ESC=cancel" TW_RESET);
+                draw_sd_fields(fname, bank, 1, 0);
+                termw_move(SD_ROW_FNAME, 12 + fname_len);
+                termw_flush();
+            }
+        }
+    }
 }
 
 /* ═══════════════════════════════════ main browser loop ══════════ */
@@ -727,12 +1128,11 @@ static void ensure_visible(void)
 }
 
 /*
- * Core browser event loop.
- * Returns 1 if a patch was loaded / saved, 0 if cancelled.
- * In LOAD mode, fills *result on success.
- * In SAVE mode, result may be NULL.
+ * Load browser event loop.
+ * Fills *result and returns 1 when the user selects a file.
+ * Returns 0 if cancelled (ESC).
  */
-static int run_browser(Patch *result, const Patch *to_save)
+static int run_browser(Patch *result)
 {
     scan_dir();
     draw_all();
@@ -776,22 +1176,21 @@ static int run_browser(Patch *result, const Patch *to_save)
                     push_dir(e->name);
                 scan_dir();
 
-            } else if (mode == PB_LOAD) {
+            } else {
                 /* load the selected file */
                 char path[EPATH_BUF];
                 entry_path(path, sizeof(path), e->name);
 
                 const char *dot = strrchr(e->name, '.');
-                int is_json = (dot && strcmp(dot, ".pjs") == 0);
+                int is_pjs = (dot && strcmp(dot, ".pjs") == 0);
 
-                Patch     tmp;
-                char      name[64], author[64], comment[128];
-                int       ok = is_json
+                Patch tmp;
+                char  name[64], author[64], comment[128];
+                int   ok = is_pjs
                     ? load_json(path, &tmp, name, author, comment)
                     : load_legacy(path, &tmp);
 
                 if (ok < 0) {
-                    /* show brief error then stay in browser */
                     termw_move(ROW_PREVIEW, 2);
                     printf(TW_RED TW_BOLD "ERROR: cannot load file." TW_RESET);
                     termw_flush();
@@ -801,7 +1200,6 @@ static int run_browser(Patch *result, const Patch *to_save)
                     return 1;
                 }
             }
-            /* in SAVE mode, Enter on a file does nothing — use S to save */
 
         } else if (ch == 'n' || ch == 'N') {
             /* create a new directory in the current location */
@@ -824,8 +1222,6 @@ static int run_browser(Patch *result, const Patch *to_save)
                 }
             }
 
-        } else if ((ch == 's' || ch == 'S') && mode == PB_SAVE) {
-            if (do_save(to_save)) return 1;
         }
 
         ensure_visible();
@@ -858,15 +1254,11 @@ void patchbrowser_init(void)
 
 int patchbrowser_open_load(Patch *p)
 {
-    mode       = PB_LOAD;
     rel_path[0] = '\0';   /* always start at root */
-    return run_browser(p, NULL);
+    return run_browser(p);
 }
 
 int patchbrowser_open_save(const Patch *p)
 {
-    mode       = PB_SAVE;
-    rel_path[0] = '\0';
-    Patch dummy;
-    return run_browser(&dummy, p);
+    return save_dialog(p);
 }
