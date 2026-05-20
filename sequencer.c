@@ -173,7 +173,7 @@ static void draw_step_numbers(void)
         int abs_step = page_start + s;
         /* bold on beat boundaries */
         if (abs_step % 4 == 0)
-            printf(TW_BOLD TW_DIM "%2d  " TW_RESET, abs_step + 1);
+            printf(TW_BOLD TW_YELLOW "%2d  " TW_RESET, abs_step + 1);
         else
             printf(TW_DIM "%2d  " TW_RESET, abs_step + 1);
     }
