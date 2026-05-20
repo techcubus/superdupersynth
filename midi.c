@@ -18,6 +18,7 @@
 
 static snd_seq_t *seq      = NULL;   /* ALSA sequencer handle  */
 static int        seq_port = -1;     /* our input port number  */
+static pthread_t  midi_tid = 0;      /* joinable thread handle */
 
 /* callbacks supplied by the caller */
 static void (*cb_note_on)(int) = NULL;
@@ -75,19 +76,18 @@ void midi_init(void (*on_note_on)(int), void (*on_note_off)(void))
     fprintf(stderr, "MIDI ready — connect with:  aconnect <src_port> %d:%d\n",
             snd_seq_client_id(seq), seq_port);
 
-    /* detached so we don't need to join on exit */
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &attr, midi_thread_fn, NULL);
-    pthread_attr_destroy(&attr);
+    /* joinable so midi_cleanup() can wait for the thread to fully exit
+     * before the main thread frees SID and ALSA resources */
+    pthread_create(&midi_tid, NULL, midi_thread_fn, NULL);
 }
 
 void midi_cleanup(void)
 {
     if (seq) {
-        snd_seq_close(seq);   /* unblocks snd_seq_event_input → thread exits */
+        snd_seq_close(seq);   /* closing the handle unblocks snd_seq_event_input */
         seq = NULL;
+        /* wait for the thread to finish its last callback and fully exit
+         * before the caller proceeds to free SID and ALSA resources */
+        if (midi_tid) { pthread_join(midi_tid, NULL); midi_tid = 0; }
     }
 }
