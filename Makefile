@@ -18,7 +18,7 @@ RESID_INC = -I.
 LIBS     = -lasound -lresid-builder -lm -lstdc++ -lpthread
 
 TARGET   = supersynth
-OBJS     = supersynth.o resid_wrap.o sixel.o midi.o termw.o
+OBJS     = supersynth.o resid_wrap.o sixel.o midi.o termw.o patchbrowser.o
 
 SEQ_TARGETS = seqclock sequencer
 SEQ_OBJS    = seqclock.o sequencer.o
@@ -28,7 +28,7 @@ all: $(TARGET) $(SEQ_TARGETS)
 $(TARGET): $(OBJS)
 	$(CXX) $(CFLAGS) $(RESID_LIB) -o $@ $^ $(LIBS)
 
-supersynth.o: supersynth.c
+supersynth.o: supersynth.c patch.h patchbrowser.h
 	$(CC) $(CFLAGS) $(RESID_INC) -c -o $@ $<
 
 resid_wrap.o: resid_wrap.cpp
@@ -55,7 +55,10 @@ sequencer.o: sequencer.c termw.h
 termw.o: termw.c termw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+patchbrowser.o: patchbrowser.c patchbrowser.h patch.h termw.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
-	rm -f $(OBJS) $(TARGET) $(SEQ_OBJS) $(SEQ_TARGETS) termw.o
+	rm -f $(OBJS) $(TARGET) $(SEQ_OBJS) $(SEQ_TARGETS) termw.o patchbrowser.o
 
 .PHONY: all clean

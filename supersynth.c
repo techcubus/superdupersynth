@@ -54,6 +54,8 @@
 #include "termw.h"
 #include "sixel.h"
 #include "midi.h"
+#include "patch.h"
+#include "patchbrowser.h"
 
 /* reSID C++ library – we call it through a thin C wrapper declared below */
 #ifdef __cplusplus
@@ -119,20 +121,7 @@ static const int note_data[][2] = {
 };
 
 /* ───────────────────────────────────────── patch state ── */
-typedef struct {
-    int z;          /* voice mode 1-6                         */
-    int fl;         /* effect flag 0-2                        */
-    int w1, w2;     /* waveform byte voice1, voice2           */
-    int at, de;     /* attack, decay  (0-15)                  */
-    int su, re;     /* sustain, release (0-15)                */
-    int po;         /* filter resonance/routing byte          */
-    int xt;         /* sync/sweep step                        */
-    int vi;         /* vibrato speed (frequency delta)        */
-    int vs;         /* vibrato waveform shape                 */
-    int db, dc, dd; /* pulse-width voice 1, 2, 3              */
-    int vo;         /* volume/filter mode byte                */
-    int sl;         /* sweep limit                            */
-} Patch;
+/* Patch typedef lives in patch.h, shared with patchbrowser */
 
 /* ───────────────────────────────────────── freq tables ── */
 /*
@@ -687,46 +676,32 @@ static void prompt_line(int row, int col, const char *prompt, char *buf, int max
 }
 
 /* ───────────────────────────────────────── save / load ── */
+/*
+ * save_patch / load_patch — delegate to the full patch browser.
+ * The browser is a modal overlay; it returns when the user confirms or cancels.
+ * load_patch locks sid_lock itself because apply_patch() must not race the audio
+ * thread — the mutex is released before we return so the caller need not hold it.
+ */
 static void save_patch(void)
 {
-    char fname[256] = "";
-    prompt_line(12, 4, "SOUND TO SAVE: ", fname, 240);
-    if (fname[0] == '\0') return;
-
-    FILE *f = fopen(fname, "w");
-    if (!f) {
-        termw_move(14, 4);
-        printf(TW_BOLD TW_RED "ERROR: cannot open file." TW_RESET);
-        termw_flush();
-        return;
-    }
-    /* format: 17 integers one per line, same order as original BASIC save */
-    fprintf(f,"%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n",
-            patch.z,patch.fl,patch.w1,patch.w2,patch.at,patch.de,patch.su,
-            patch.re,patch.po,patch.xt,patch.vi,patch.vs,patch.db,patch.dc,
-            patch.dd,patch.vo,patch.sl);
-    fclose(f);
+    patchbrowser_open_save(&patch);
 }
 
+/*
+ * load_patch — run the modal browser outside sid_lock (the audio thread
+ * must keep running during the UI interaction), then swap the patch and
+ * write SID registers under the lock.  The caller must NOT hold sid_lock
+ * when calling this function.
+ */
 static void load_patch(void)
 {
-    char fname[256] = "";
-    prompt_line(12, 4, "SOUND TO LOAD: ", fname, 240);
-    if (fname[0] == '\0') return;
-
-    FILE *f = fopen(fname, "r");
-    if (!f) {
-        termw_move(14, 4);
-        printf(TW_BOLD TW_RED "ERROR: file not found." TW_RESET);
-        termw_flush();
-        return;
-    }
-    fscanf(f,"%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d",
-           &patch.z,&patch.fl,&patch.w1,&patch.w2,&patch.at,&patch.de,
-           &patch.su,&patch.re,&patch.po,&patch.xt,&patch.vi,&patch.vs,
-           &patch.db,&patch.dc,&patch.dd,&patch.vo,&patch.sl);
-    fclose(f);
+    Patch tmp = patch;                    /* scratch copy; browser fills it */
+    if (!patchbrowser_open_load(&tmp))
+        return;                           /* user cancelled */
+    pthread_mutex_lock(&sid_lock);
+    patch = tmp;
     apply_patch();
+    pthread_mutex_unlock(&sid_lock);
 }
 
 /* ───────────────────────────────────────── scale load / save ── */
@@ -1116,10 +1091,8 @@ static void run_main_loop(void)
                 goto next_tick;
             }
             if (ch == TK_F7) {
-                /* F7 – load patch; apply_patch() inside load_patch() writes SID regs */
-                pthread_mutex_lock(&sid_lock);
+                /* F7 – open patch browser (lock managed inside load_patch) */
                 load_patch();
-                pthread_mutex_unlock(&sid_lock);
                 if (!show_values) draw_keyboard_screen();
                 else              draw_values_screen();
                 goto next_tick;
@@ -1217,6 +1190,9 @@ int main(int argc, char **argv)
     /* locale needed for UTF-8 box-drawing characters to render correctly */
     setlocale(LC_ALL, "");
     srand((unsigned)time(NULL));
+
+    /* create patches/ directory if absent — must happen before termw_init() */
+    patchbrowser_init();
 
     build_freq_tables();   /* seeds note_raw[] from built-in DATA */
     build_key_map();       /* must run before load_scale() */
