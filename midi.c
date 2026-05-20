@@ -1,10 +1,10 @@
 /*
  * midi.c — ALSA sequencer MIDI input for supersynth.
  *
- * Spawns a detached listener thread that blocks on snd_seq_event_input().
+ * Spawns a joinable listener thread that blocks on snd_seq_event_input().
  * note-on and note-off events are forwarded to caller-supplied callbacks.
- * snd_seq_close() in midi_cleanup() unblocks the call, causing the
- * thread to exit cleanly.
+ * midi_cleanup() closes the seq handle (unblocking the thread) then joins
+ * to ensure the thread is fully done before the caller frees resources.
  *
  * This module has no knowledge of SID state, patches, or ncurses.
  * Thread safety for SID access is the caller's responsibility.
@@ -26,11 +26,16 @@ static void (*cb_note_off)(void) = NULL;
 
 static void *midi_thread_fn(void *arg)
 {
-    (void)arg;
+    /* Use a local copy of the handle passed at thread creation.
+     * The main thread sets the global seq=NULL during cleanup; using the
+     * local copy means we never call snd_seq_event_input(NULL,...), which
+     * would trigger ALSA's internal assert and abort. */
+    snd_seq_t      *s  = (snd_seq_t *)arg;
     snd_seq_event_t *ev;
 
-    /* blocks until an event arrives; returns < 0 when seq is closed */
-    while (snd_seq_event_input(seq, &ev) >= 0) {
+    /* snd_seq_close() in midi_cleanup() closes the underlying fd, causing
+     * this blocking call to return < 0 (EBADF) and exit the loop */
+    while (snd_seq_event_input(s, &ev) >= 0) {
         switch (ev->type) {
         case SND_SEQ_EVENT_NOTEON:
             if (ev->data.note.velocity > 0) {
@@ -76,9 +81,8 @@ void midi_init(void (*on_note_on)(int), void (*on_note_off)(void))
     fprintf(stderr, "MIDI ready — connect with:  aconnect <src_port> %d:%d\n",
             snd_seq_client_id(seq), seq_port);
 
-    /* joinable so midi_cleanup() can wait for the thread to fully exit
-     * before the main thread frees SID and ALSA resources */
-    pthread_create(&midi_tid, NULL, midi_thread_fn, NULL);
+    /* pass seq as arg so the thread has its own local copy of the handle */
+    pthread_create(&midi_tid, NULL, midi_thread_fn, seq);
 }
 
 void midi_cleanup(void)
