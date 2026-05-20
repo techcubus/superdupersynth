@@ -348,19 +348,17 @@ static int load_json(const char *path, Patch *p,
  */
 static int load_legacy(const char *path, Patch *p)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "rb");  /* binary mode: do not translate \r */
     if (!f) return -1;
 
-    int  vals[17];
-    int  n = 0;
-    char line[64];
+    int vals[17];
+    int n = 0;
 
-    while (n < 17 && fgets(line, sizeof(line), f)) {
-        char *endp;
-        long  v = strtol(line, &endp, 10);
-        if (endp != line)   /* line contained at least one digit */
-            vals[n++] = (int)v;
-    }
+    /* fscanf " %d" skips any whitespace (space, \r, \n) between values,
+     * so this handles both Unix (LF) and original C64 (CR-only) line endings */
+    while (n < 17 && fscanf(f, " %d", &vals[n]) == 1)
+        n++;
+
     fclose(f);
 
     if (n < 17) return -1;  /* file was truncated */
