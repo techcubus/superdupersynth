@@ -1,10 +1,10 @@
 /*
  * midi.c — ALSA sequencer MIDI input for supersynth.
  *
- * Spawns a joinable listener thread that blocks on snd_seq_event_input().
- * note-on and note-off events are forwarded to caller-supplied callbacks.
- * midi_cleanup() closes the seq handle (unblocking the thread) then joins
- * to ensure the thread is fully done before the caller frees resources.
+ * Spawns a joinable listener thread that polls the ALSA sequencer with a
+ * short timeout and checks a stop flag, so it can exit cleanly on demand.
+ * midi_cleanup() sets the stop flag, joins the thread, then closes the
+ * seq handle — avoiding any race between the thread and snd_seq_close().
  *
  * This module has no knowledge of SID state, patches, or ncurses.
  * Thread safety for SID access is the caller's responsibility.
@@ -12,13 +12,15 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <poll.h>
 #include <alsa/asoundlib.h>
 #include <pthread.h>
 #include "midi.h"
 
-static snd_seq_t *seq      = NULL;   /* ALSA sequencer handle  */
-static int        seq_port = -1;     /* our input port number  */
-static pthread_t  midi_tid = 0;      /* joinable thread handle */
+static snd_seq_t       *seq      = NULL;  /* ALSA sequencer handle  */
+static int              seq_port = -1;    /* our input port number  */
+static pthread_t        midi_tid = 0;     /* joinable thread handle */
+static volatile int     midi_stop = 0;   /* set to 1 to ask thread to exit */
 
 /* callbacks supplied by the caller */
 static void (*cb_note_on)(int) = NULL;
@@ -26,33 +28,41 @@ static void (*cb_note_off)(void) = NULL;
 
 static void *midi_thread_fn(void *arg)
 {
-    /* Use a local copy of the handle passed at thread creation.
-     * The main thread sets the global seq=NULL during cleanup; using the
-     * local copy means we never call snd_seq_event_input(NULL,...), which
-     * would trigger ALSA's internal assert and abort. */
-    snd_seq_t      *s  = (snd_seq_t *)arg;
+    snd_seq_t      *s = (snd_seq_t *)arg;  /* local copy — never becomes NULL */
     snd_seq_event_t *ev;
+    struct pollfd    pfd;
 
-    /* snd_seq_close() in midi_cleanup() closes the underlying fd, causing
-     * this blocking call to return < 0 (EBADF) and exit the loop */
-    while (snd_seq_event_input(s, &ev) >= 0) {
-        switch (ev->type) {
-        case SND_SEQ_EVENT_NOTEON:
-            if (ev->data.note.velocity > 0) {
-                /* genuine note-on */
-                if (cb_note_on) cb_note_on(ev->data.note.note);
-            } else {
-                /* velocity-0 note-on is note-off per MIDI spec */
+    /* get the poll descriptor for reading; one fd is enough for our port */
+    snd_seq_poll_descriptors(s, &pfd, 1, POLLIN);
+
+    while (!midi_stop) {
+        /* poll with a short timeout so we wake up regularly to check midi_stop */
+        int r = poll(&pfd, 1, 50);
+        if (r < 0) break;
+        if (r == 0) continue;   /* timeout — go back and check midi_stop */
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+
+        /* drain all pending events in one burst */
+        while (snd_seq_event_input_pending(s, 0) > 0) {
+            if (snd_seq_event_input(s, &ev) < 0) goto done;
+            switch (ev->type) {
+            case SND_SEQ_EVENT_NOTEON:
+                if (ev->data.note.velocity > 0) {
+                    if (cb_note_on) cb_note_on(ev->data.note.note);
+                } else {
+                    /* velocity-0 note-on = note-off per MIDI spec */
+                    if (cb_note_off) cb_note_off();
+                }
+                break;
+            case SND_SEQ_EVENT_NOTEOFF:
                 if (cb_note_off) cb_note_off();
+                break;
+            default:
+                break;
             }
-            break;
-        case SND_SEQ_EVENT_NOTEOFF:
-            if (cb_note_off) cb_note_off();
-            break;
-        default:
-            break;
         }
     }
+done:
     return NULL;
 }
 
@@ -87,11 +97,14 @@ void midi_init(void (*on_note_on)(int), void (*on_note_off)(void))
 
 void midi_cleanup(void)
 {
-    if (seq) {
-        snd_seq_close(seq);   /* closing the handle unblocks snd_seq_event_input */
+    if (seq && midi_tid) {
+        /* signal the poll loop to exit, then wait for the thread to finish
+         * before closing seq — avoids closing the handle under the thread */
+        midi_stop = 1;
+        pthread_join(midi_tid, NULL);
+        midi_tid  = 0;
+        midi_stop = 0;
+        snd_seq_close(seq);
         seq = NULL;
-        /* wait for the thread to finish its last callback and fully exit
-         * before the caller proceeds to free SID and ALSA resources */
-        if (midi_tid) { pthread_join(midi_tid, NULL); midi_tid = 0; }
     }
 }
