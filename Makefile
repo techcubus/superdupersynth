@@ -20,7 +20,10 @@ LIBS     = -lncurses -lasound -lresid-builder -lm -lstdc++ -lpthread
 TARGET   = supersynth
 OBJS     = supersynth.o resid_wrap.o sixel.o midi.o
 
-all: $(TARGET)
+SEQ_TARGET = seqclock
+SEQ_OBJS   = seqclock.o
+
+all: $(TARGET) $(SEQ_TARGET)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(CFLAGS) $(RESID_LIB) -o $@ $^ $(LIBS)
@@ -37,7 +40,13 @@ sixel.o: sixel.c sixel.h
 midi.o: midi.c midi.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(SEQ_TARGET): $(SEQ_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ -lasound -lpthread
+
+seqclock.o: seqclock.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) $(SEQ_OBJS) $(SEQ_TARGET)
 
 .PHONY: all clean
