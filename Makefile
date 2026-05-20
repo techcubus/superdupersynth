@@ -46,13 +46,16 @@ seqclock: seqclock.o
 seqclock.o: seqclock.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-sequencer: sequencer.o
-	$(CC) $(CFLAGS) -o $@ $^ -lncurses -lasound
+sequencer: sequencer.o termw.o
+	$(CC) $(CFLAGS) -o $@ $^ -lasound
 
-sequencer.o: sequencer.c
+sequencer.o: sequencer.c termw.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+termw.o: termw.c termw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(SEQ_OBJS) $(SEQ_TARGETS)
+	rm -f $(OBJS) $(TARGET) $(SEQ_OBJS) $(SEQ_TARGETS) termw.o
 
 .PHONY: all clean
