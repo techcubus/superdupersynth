@@ -15,10 +15,10 @@ CXXFLAGS = $(CFLAGS)
 RESID_INC = -I.
 # RESID_LIB = -L/usr/local/lib
 
-LIBS     = -lncurses -lasound -lresid-builder -lm -lstdc++ -lpthread
+LIBS     = -lasound -lresid-builder -lm -lstdc++ -lpthread
 
 TARGET   = supersynth
-OBJS     = supersynth.o resid_wrap.o sixel.o midi.o
+OBJS     = supersynth.o resid_wrap.o sixel.o midi.o termw.o
 
 SEQ_TARGETS = seqclock sequencer
 SEQ_OBJS    = seqclock.o sequencer.o

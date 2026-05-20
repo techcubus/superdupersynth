@@ -268,9 +268,16 @@ giving legato or tied articulation.
 
 ## Known issues and missing features
 
-- **Note release on keyboard** — ncurses has no key-up events.  A 120 ms
-  timer is used as a workaround; it works but limits playing style.  MIDI
-  input does not have this limitation.
+- **Note release on keyboard** — Linux gives key-*down* events only; there
+  are no key-up events in raw terminal mode.  We approximate key release by
+  watching for keyboard auto-repeat (held keys repeat at ~30 Hz / 33 ms) and
+  gating off after 60 ms of silence.  This works well at default repeat
+  settings but breaks down if the OS repeat delay is set very high or repeat
+  is disabled entirely — in those cases notes will sustain for 60 ms regardless
+  of how long the key is held.  The original C64 used `PEEK(197)`, a hardware
+  register that reports the instantaneous key state directly; there is no
+  equivalent on a PC without reading `/dev/input` events.  MIDI input does not
+  have this limitation.
 - **`xt` sync speed** — stored and saved/loaded but not applied to the SID.
 - **Z=4 pitch sweep** — the original BASIC lines 380–390 sweep the voice 3
   frequency; not yet implemented.
