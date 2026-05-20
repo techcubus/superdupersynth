@@ -230,7 +230,7 @@ static void draw_status(void)
     termw_move(row, COL_MARGIN);
     printf(TW_DIM " Oct:%d  T%d:Step%02d  "
            "[arrows=nav  PgUp/Dn=page  [/]=oct"
-           "  F2=accent  F3=slide  F4=tie  DEL=rest  ESC=quit]"
+           "  a=accent  s=slide  d=rest  f=tie  ESC=quit]"
            TW_RESET,
            entry_octave, cursor_track + 1, cursor_step + 1);
 }
@@ -337,16 +337,17 @@ int main(void)
                     }
                 }
 
-            /* ── clear step ── */
-            } else if (ch == TK_DEL || ch == TK_BACKSPACE) {
-                pat.steps[cursor_track][cursor_step].note = -1;
-
-            /* ── attribute toggles ── */
-            } else if (ch == TK_F2) {
+            /* ── step flags / clear (home row, no conflict with piano keys) ── */
+            } else if (ch == 'a') {
                 pat.steps[cursor_track][cursor_step].accent ^= 1;
-            } else if (ch == TK_F3) {
+            } else if (ch == 's') {
                 pat.steps[cursor_track][cursor_step].slide ^= 1;
-            } else if (ch == TK_F4) {
+            } else if (ch == 'd' || ch == TK_DEL || ch == TK_BACKSPACE) {
+                pat.steps[cursor_track][cursor_step].note   = -1;
+                pat.steps[cursor_track][cursor_step].accent = 0;
+                pat.steps[cursor_track][cursor_step].slide  = 0;
+                pat.steps[cursor_track][cursor_step].tie    = 0;
+            } else if (ch == 'f') {
                 pat.steps[cursor_track][cursor_step].tie ^= 1;
             }
         }
