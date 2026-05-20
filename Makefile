@@ -47,7 +47,7 @@ seqclock.o: seqclock.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sequencer: sequencer.o termw.o
-	$(CC) $(CFLAGS) -o $@ $^ -lasound
+	$(CC) $(CFLAGS) -o $@ $^ -lasound -lpthread
 
 sequencer.o: sequencer.c termw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
