@@ -25,7 +25,7 @@
  *   ESC         cancel / close browser
  *
  * File formats:
- *   .json       Preferred — carries name, author, comment metadata.
+ *   .pjs       Preferred — carries name, author, comment metadata.
  *   anything    Legacy — 17 integers one per line; all values are
  *               range-clamped on read.
  */
@@ -525,9 +525,9 @@ static void draw_grid(void)
                 /* directory: cyan */
                 printf(TW_CYAN "  %-*s" TW_RESET, ENTRY_WIDTH, disp);
             } else {
-                /* check for .json extension */
+                /* check for .pjs extension */
                 const char *dot = strrchr(e->name, '.');
-                if (dot && strcmp(dot, ".json") == 0)
+                if (dot && strcmp(dot, ".pjs") == 0)
                     printf("  %-*s", ENTRY_WIDTH, disp);        /* normal weight */
                 else
                     printf(TW_DIM "  %-*s" TW_RESET, ENTRY_WIDTH, disp); /* legacy: dim */
@@ -565,7 +565,7 @@ static void draw_preview(void)
 
     /* detect format by extension */
     const char *dot = strrchr(e->name, '.');
-    int is_json = (dot && strcmp(dot, ".json") == 0);
+    int is_json = (dot && strcmp(dot, ".pjs") == 0);
 
     Patch      tmp;
     char       name[64]    = "";
@@ -690,12 +690,12 @@ static int do_save(const Patch *p)
     pb_prompt(ROW_PREVIEW + 3, 2, "Comment:           ", comment, 126);
     /* comment is optional too */
 
-    /* build the full path: current dir / filename.json */
+    /* build the full path: current dir / filename.pjs */
     char path[EPATH_BUF];
     {
         char dir[PATH_BUF];
         full_path(dir, sizeof(dir));
-        snprintf(path, sizeof(path), "%s/%s.json", dir, fname);
+        snprintf(path, sizeof(path), "%s/%s.pjs", dir, fname);
     }
 
     if (save_json(path, p, name, author, comment) < 0) {
@@ -782,7 +782,7 @@ static int run_browser(Patch *result, const Patch *to_save)
                 entry_path(path, sizeof(path), e->name);
 
                 const char *dot = strrchr(e->name, '.');
-                int is_json = (dot && strcmp(dot, ".json") == 0);
+                int is_json = (dot && strcmp(dot, ".pjs") == 0);
 
                 Patch     tmp;
                 char      name[64], author[64], comment[128];

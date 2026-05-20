@@ -5,7 +5,7 @@
  * patches/ directory and will not navigate above it.
  *
  * Two file formats are supported:
- *   .json   Rich format with name, author, comment metadata.
+ *   .pjs    Rich format with name, author, comment metadata.
  *           Default for all saves.
  *   other   Legacy plain-text format (17 integers, one per line) matching
  *           the original C64 save convention.  Values are range-clamped on
