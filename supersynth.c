@@ -166,7 +166,8 @@ typedef struct {
 #define FIELD_NAME    17
 #define FIELD_AUTHOR  18
 #define FIELD_COMMENT 19
-#define ED_DIVIDER    39  /* column of │ between the two param columns */
+#define ED_DIV1       24  /* │ between left and centre param columns */
+#define ED_DIV2       45  /* │ between centre column and scope area  */
 
 static PField pfields[NPARAMS];
 
@@ -1015,9 +1016,9 @@ static void init_pfields(void)
         "1=oct up  2-5=normal  6=oct down");
     PF( 1, "FL", "effect",        &patch.fl, 0, 2,
         "0=none  1=vibrato  2=filter sweep");
-    PF( 2, "W1", "voice 1 wave",  &patch.w1, 0, 255,
+    PF( 2, "W1", "v1 waveform",   &patch.w1, 0, 255,
         "waveform+gate byte  17=tri 33=saw 65=pulse 129=noise");
-    PF( 3, "W2", "voice 2 wave",  &patch.w2, 0, 255,
+    PF( 3, "W2", "v2 waveform",   &patch.w2, 0, 255,
         "waveform+gate byte for voice 2");
     PF( 4, "AT", "attack",        &patch.at, 0, 15,
         "attack time  0=fastest  15=slowest");
@@ -1043,32 +1044,51 @@ static void init_pfields(void)
         "pulse-width high byte for voice 3");
     PF(15, "VO", "filter/vol",    &patch.vo, 0, 255,
         "filter mode and master volume byte");
-    PF(16, "SL", "sweep limit",   &patch.sl, 0, 255,
+    PF(16, "SL", "sweep lim",     &patch.sl, 0, 255,
         "filter sweep upper limit (FL=2)");
 #undef PF
 }
 
 /*
  * Draw one numeric param field at its position in the two-column grid.
- * Fields 0-8 go in the left column (rows 3-11); 9-16 in the right (rows 3-10).
+ * Fields 0-8 go in the left column (rows 3-11, cols 2-ED_DIV1-1).
+ * Fields 9-16 go in the centre column (rows 3-10, cols ED_DIV1+1 to ED_DIV2-1).
  */
 static void draw_ed_param(int fi, int sel)
 {
-    int row  = (fi < 9) ? (3 + fi) : (3 + fi - 9);
-    int scol = (fi < 9) ? 2 : (ED_DIVIDER + 2);
+    int row, scol;
+    if (fi < 9) {
+        row  = 3 + fi;
+        scol = 2;
+    } else {
+        row  = 3 + (fi - 9);
+        scol = ED_DIV1 + 1;
+    }
     const PField *pf = &pfields[fi];
     termw_move(row, scol);
-    if (sel)
-        printf(TW_REVERSE TW_BOLD "> %-2s %-13s %4d" TW_RESET,
-               pf->var, pf->label, *pf->field);
-    else
-        printf("  %-2s " TW_CYAN "%-13s" TW_RESET " %4d",
-               pf->var, pf->label, *pf->field);
+    if (fi < 9) {
+        /* left column: 11-char label, 4-digit value */
+        if (sel)
+            printf(TW_REVERSE TW_BOLD "> %-2s %-11.11s%4d" TW_RESET,
+                   pf->var, pf->label, *pf->field);
+        else
+            printf("  %-2s " TW_CYAN "%-11.11s" TW_RESET "%4d",
+                   pf->var, pf->label, *pf->field);
+    } else {
+        /* centre column: 10-char label, 3-digit value */
+        if (sel)
+            printf(TW_REVERSE TW_BOLD "> %-2s %-10.10s%3d" TW_RESET,
+                   pf->var, pf->label, *pf->field);
+        else
+            printf("  %-2s " TW_CYAN "%-10.10s" TW_RESET "%3d",
+                   pf->var, pf->label, *pf->field);
+    }
 }
 
 /*
  * Draw one metadata field (name / author / comment) at rows 13-15.
  * edit=1: show underscore cursor; edit_buf holds the in-progress text.
+ * Metadata rows span the two left param columns (cols 2 to ED_DIV2-2).
  */
 static void draw_ed_meta(int fi, int sel, int edit, const char *edit_buf)
 {
@@ -1079,12 +1099,13 @@ static void draw_ed_meta(int fi, int sel, int edit, const char *edit_buf)
                        (mi == 0 ? patch_name :
                         mi == 1 ? patch_author : patch_comment);
     termw_move(row, 2);
+    /* text area: cols 12-43 = 32 chars (2+1+7+1+prefix = col 12, to ED_DIV2-2=43) */
     if (sel && !edit)
-        printf(TW_REVERSE TW_BOLD "> %-7s %-65.65s" TW_RESET, labels[mi], text);
+        printf(TW_REVERSE TW_BOLD "> %-7s %-32.32s" TW_RESET, labels[mi], text);
     else if (edit)
-        printf(TW_REVERSE TW_BOLD "> %-7s %-64.64s_" TW_RESET, labels[mi], text);
+        printf(TW_REVERSE TW_BOLD "> %-7s %-31.31s_" TW_RESET, labels[mi], text);
     else
-        printf("  %-7s " TW_CYAN "%-65.65s" TW_RESET, labels[mi], text);
+        printf("  %-7s " TW_CYAN "%-32.32s" TW_RESET, labels[mi], text);
 }
 
 static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
@@ -1102,37 +1123,50 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
     termw_move(23, 0);
     printf("╚"); for (int c = 1; c < 79; c++) printf("═"); printf("╝");
 
-    /* row 2: separator with column-divider tee */
+    /* row 2: separator with two column-divider tees */
     termw_move(2, 0);
     printf("╠");
-    for (int c = 1; c < 79; c++)
-        printf("%s", c == ED_DIVIDER ? "╤" : "═");
+    for (int c = 1; c < 79; c++) {
+        if      (c == ED_DIV1) printf("╤");
+        else if (c == ED_DIV2) printf("╤");
+        else                   printf("═");
+    }
     printf("╣");
 
-    /* rows 3-11: centre column divider */
-    for (int r = 3; r < 12; r++) { termw_move(r, ED_DIVIDER); printf("│"); }
+    /* rows 3-11: two column dividers */
+    for (int r = 3; r < 12; r++) {
+        termw_move(r, ED_DIV1); printf("│");
+        termw_move(r, ED_DIV2); printf("│");
+    }
 
-    /* row 12: separator collapsing the column tee */
+    /* row 12: close both column tees */
     termw_move(12, 0);
     printf("╠");
-    for (int c = 1; c < 79; c++)
-        printf("%s", c == ED_DIVIDER ? "╧" : "═");
+    for (int c = 1; c < 79; c++) {
+        if      (c == ED_DIV1) printf("╧");
+        else if (c == ED_DIV2) printf("╧");
+        else                   printf("═");
+    }
     printf("╣");
 
-    /* rows 16, 22: full-width separators */
+    /* rows 16 and 22: full-width separators */
     termw_move(16, 0);
     printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
     termw_move(22, 0);
     printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
     printf(TW_RESET);
 
-    /* title */
+    /* title — fits within left+centre columns */
     termw_move(1, 2);
     printf(TW_BOLD TW_BG_BLUE TW_WHITE " PATCH EDITOR " TW_RESET);
     if (patch_name[0]) {
         termw_move(1, 18);
-        printf(TW_CYAN "%.55s" TW_RESET, patch_name);
+        printf(TW_CYAN "%.25s" TW_RESET, patch_name);  /* cols 18-44 */
     }
+
+    /* scope column header (rows 1 and 3 — above the sixel image which starts row 4) */
+    termw_move(1, ED_DIV2 + 2);
+    printf(TW_DIM "oscilloscope" TW_RESET);
 
     /* all numeric params */
     for (int i = 0; i < NPARAMS; i++)
@@ -1144,10 +1178,10 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
                      (edit_mode && i == sel) ? 1 : 0,
                      (edit_mode && i == sel) ? edit_buf : "");
 
-    /* info area: range + one-line description */
+    /* info area — kept within cols 2-44 to avoid scope area */
     termw_move(17, 2);
     if (sel < NPARAMS) {
-        printf(TW_DIM "Range %d-%d  " TW_RESET "%.60s",
+        printf(TW_DIM "Range %d-%d  " TW_RESET "%.40s",
                pfields[sel].lo, pfields[sel].hi, pfields[sel].desc);
     } else {
         static const char *meta_hints[3] = {
@@ -1155,7 +1189,7 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
             "Author name stored in .pjs metadata",
             "Freeform comment stored in .pjs metadata",
         };
-        printf("%.72s", meta_hints[sel - NPARAMS]);
+        printf("%.43s", meta_hints[sel - NPARAMS]);
     }
 
     /* hints bar */
@@ -1164,10 +1198,12 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
         printf(TW_DIM "Type to edit  ENTER=confirm  ESC=cancel" TW_RESET);
     else
         printf(TW_DIM
-               "↑↓ navigate  ←→ adjust  ENTER=edit text  F5=save  ESC=back"
+               "↑↓ nav  ←→ adjust  ENTER=edit  F5=save  ESC=back"
                TW_RESET);
 
+    /* sixel scope overlay — flush text first, then write scope to /dev/tty */
     termw_flush();
+    scope_redraw();
 }
 
 static void run_editor(void)
