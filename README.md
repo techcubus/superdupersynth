@@ -166,6 +166,106 @@ always uses standard equal temperament regardless of the loaded scale.
 
 ---
 
+## Sequencer and clock
+
+`make` also builds two standalone tools that talk to each other and to
+`supersynth` via ALSA sequencer ports:
+
+| Binary | Purpose |
+|--------|---------|
+| `seqclock` | MIDI clock master — generates 24 PPQN clock and transport |
+| `sequencer` | 4-track × 64-step grid editor with live playback |
+
+### Ports exposed
+
+```
+seqclock  port 0  "clock out"     — sends CLOCK, START, STOP, CONTINUE
+          port 1  "clock in"      — stub (reserved for future slave mode)
+
+sequencer port 0  "notes out"     — sends note-on/off (track N → MIDI ch N)
+          port 1  "clock in"      — receives CLOCK/START/STOP/CONTINUE
+          port 2  "transport out" — sends START/STOP when space bar pressed
+```
+
+### Verifying the clock with aseqdump
+
+Start `seqclock` in one terminal, then in another:
+
+```bash
+aseqdump -p seqclock:0
+```
+
+You should see a stream of `Clock` events at 24 PPQN, bracketed by
+`Start` and `Stop` when you press space in seqclock.
+
+```
+Source  Event                  Ch  Data
+ 20:0   Start
+ 20:0   Clock
+ 20:0   Clock
+ 20:0   Clock
+ ...
+ 20:0   Stop
+```
+
+If the client number differs, use whatever `aconnect -l` shows.
+
+### Wiring everything together
+
+```bash
+# 1. list all ALSA sequencer ports
+aconnect -l
+
+# 2. clock master → sequencer
+aconnect seqclock:0 sequencer:1
+
+# 3. sequencer notes → supersynth (once supersynth has a MIDI-in port)
+aconnect sequencer:0 supersynth:1
+
+# 4. disconnect everything cleanly
+aconnect -d seqclock:0 sequencer:1
+```
+
+After connecting clock, press space in `seqclock` **or** space in
+`sequencer` to start.  Both send ALSA `START`; whoever starts first
+will drive transport.
+
+### Sequencer key bindings
+
+| Key | Action |
+|-----|--------|
+| `q 2 w 3 e r 5 t 6 y 7 u i` | Enter note (C C# D … B C+1) at cursor, advance right |
+| `[ ]` | Entry octave down / up |
+| `- =` | Transpose cursor step ±1 octave |
+| `← → ↑ ↓` | Move cursor |
+| `PgUp / PgDn` | Page left / right (16 steps per page) |
+| `a` | Toggle accent (velocity 127) |
+| `s` | Toggle slide (suppresses note-off into next step) |
+| `f` | Toggle tie (holds note, no re-trigger) |
+| `d` / `DEL` / `BS` | Clear step (rest + all flags) |
+| `l` | Set pattern length to cursor step |
+| `SPC` | Start / stop playback |
+| `ESC` | Quit |
+
+Step numbers that are multiples of 4 (1, 5, 9, 13 …) are highlighted
+orange.  The last step of the pattern is shown in red with a `]`
+marker.  The playback cursor is shown with a cyan background.
+
+Each track sends on its own MIDI channel: T1→ch 1, T2→ch 2, etc.
+Slide or tie on a step suppresses the note-off before the next step,
+giving legato or tied articulation.
+
+### seqclock key bindings
+
+| Key | Action |
+|-----|--------|
+| `SPC` | Start / stop clock |
+| `↑ ↓` | BPM +1 / -1 |
+| `PgUp / PgDn` | BPM +10 / -10 |
+| `ESC` | Quit |
+
+---
+
 ## Known issues and missing features
 
 - **Note release on keyboard** — ncurses has no key-up events.  A 120 ms
@@ -180,3 +280,10 @@ always uses standard equal temperament regardless of the loaded scale.
   dedicated audio thread would fix this but is not implemented.
 - **Single voice** — currently monophonic.  Multi-SID polyphony (one SID
   instance per MIDI channel) is planned.
+- **Sequencer requires external clock** — `sequencer` is a clock slave;
+  step advancement only happens when MIDI clock pulses arrive.  Connect
+  `seqclock` first.  An internal fallback clock is not yet implemented.
+- **seqclock → sequencer transport** — pressing space in `sequencer`
+  sends `START`/`STOP` on its transport port, but `seqclock` does not
+  yet listen for incoming transport.  Start and stop the clock from
+  `seqclock` for now.
