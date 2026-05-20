@@ -172,7 +172,10 @@ static void draw_step_numbers(void)
     for (int s = 0; s < PAGE_STEPS; s++) {
         int abs_step = page_start + s;
         /* bold on beat boundaries */
-        if (abs_step % 4 == 0)
+        int is_last = (abs_step == pat.length - 1);
+        if (is_last)
+            printf(TW_BOLD TW_BRED "%2d] " TW_RESET, abs_step + 1);
+        else if (abs_step % 4 == 0)
             printf(TW_BOLD TW_YELLOW "%2d  " TW_RESET, abs_step + 1);
         else
             printf(TW_DIM "%2d  " TW_RESET, abs_step + 1);
@@ -228,11 +231,11 @@ static void draw_status(void)
 {
     int row = ROW_GRID + NUM_TRACKS * 2 + 1;
     termw_move(row, COL_MARGIN);
-    printf(TW_DIM " Oct:%d  T%d:Step%02d  "
+    printf(TW_DIM " Oct:%d  T%d:Step%02d  Len:%02d  "
            "[arrows=nav  PgUp/Dn=page  [/]=oct  -/+=note oct"
-           "  a=accent  s=slide  d=rest  f=tie  ESC=quit]"
+           "  a=accent  s=slide  d=rest  f=tie  l=last  ESC=quit]"
            TW_RESET,
-           entry_octave, cursor_track + 1, cursor_step + 1);
+           entry_octave, cursor_track + 1, cursor_step + 1, pat.length);
 }
 
 static void draw_grid(void)
@@ -349,6 +352,9 @@ int main(void)
                 pat.steps[cursor_track][cursor_step].tie    = 0;
             } else if (ch == 'f') {
                 pat.steps[cursor_track][cursor_step].tie ^= 1;
+            } else if (ch == 'l') {
+                pat.length = cursor_step + 1;
+                dirty_all = 1;
             } else if (ch == '-') {
                 int *n = &pat.steps[cursor_track][cursor_step].note;
                 if (*n >= 12) *n -= 12;
