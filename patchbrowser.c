@@ -886,7 +886,8 @@ static void clear_sd_conflict(void)
  * The .pjs extension is always appended automatically.
  * Bank names that collide with existing regular files are rejected.
  */
-static int save_dialog(const Patch *p)
+static int save_dialog(const Patch *p,
+                       const char *name, const char *author, const char *comment)
 {
     scan_banks();
 
@@ -986,7 +987,7 @@ static int save_dialog(const Patch *p)
                 } else {
                     /* no conflict — create bank dir if new, then save */
                     if (bank[0]) mkdir(dir, 0755);
-                    if (save_json(conflict_path, p, "", "", "") < 0) {
+                    if (save_json(conflict_path, p, name, author, comment) < 0) {
                         termw_move(SD_ROW_PREV, 2);
                         printf(TW_RED TW_BOLD
                                "ERROR: could not write file." TW_RESET);
@@ -1088,7 +1089,7 @@ static int save_dialog(const Patch *p)
                 else
                     snprintf(dir, sizeof(dir), "%s", patches_root);
                 if (bank[0]) mkdir(dir, 0755);
-                if (save_json(conflict_path, p, "", "", "") < 0) {
+                if (save_json(conflict_path, p, name, author, comment) < 0) {
                     termw_move(SD_ROW_PREV, 2);
                     printf(TW_RED TW_BOLD "ERROR: could not write file." TW_RESET);
                     termw_flush();
@@ -1132,7 +1133,7 @@ static void ensure_visible(void)
  * Fills *result and returns 1 when the user selects a file.
  * Returns 0 if cancelled (ESC).
  */
-static int run_browser(Patch *result)
+static int run_browser(Patch *result, char *name, char *author, char *comment)
 {
     scan_dir();
     draw_all();
@@ -1185,10 +1186,15 @@ static int run_browser(Patch *result)
                 int is_pjs = (dot && strcmp(dot, ".pjs") == 0);
 
                 Patch tmp;
-                char  name[64], author[64], comment[128];
-                int   ok = is_pjs
-                    ? load_json(path, &tmp, name, author, comment)
-                    : load_legacy(path, &tmp);
+                int   ok;
+                if (is_pjs) {
+                    ok = load_json(path, &tmp, name, author, comment);
+                } else {
+                    ok = load_legacy(path, &tmp);
+                    if (ok == 0) {
+                        name[0] = '\0'; author[0] = '\0'; comment[0] = '\0';
+                    }
+                }
 
                 if (ok < 0) {
                     termw_move(ROW_PREVIEW, 2);
@@ -1252,13 +1258,14 @@ void patchbrowser_init(void)
     rel_path[0] = '\0';
 }
 
-int patchbrowser_open_load(Patch *p)
+int patchbrowser_open_load(Patch *p, char *name, char *author, char *comment)
 {
     rel_path[0] = '\0';   /* always start at root */
-    return run_browser(p);
+    return run_browser(p, name, author, comment);
 }
 
-int patchbrowser_open_save(const Patch *p)
+int patchbrowser_open_save(const Patch *p,
+                           const char *name, const char *author, const char *comment)
 {
-    return save_dialog(p);
+    return save_dialog(p, name, author, comment);
 }

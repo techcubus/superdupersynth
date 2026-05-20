@@ -147,6 +147,29 @@ static void       *sid   = NULL;
 static snd_pcm_t  *pcm   = NULL;
 static Patch       patch;
 
+/* metadata displayed and edited alongside the patch parameters */
+static char patch_name[64]     = "";
+static char patch_author[64]   = "";
+static char patch_comment[128] = "";
+
+/* ── patch field descriptor (populated by init_pfields) ── */
+typedef struct {
+    const char *var;    /* BASIC variable name, e.g. "AT" */
+    const char *label;  /* short description, e.g. "attack" */
+    int        *field;  /* pointer into the global patch struct */
+    int         lo, hi; /* inclusive valid range */
+    const char *desc;   /* one-line info shown in the editor */
+} PField;
+
+#define NPARAMS     17   /* numeric patch fields */
+#define NFIELDS     20   /* NPARAMS + 3 metadata fields */
+#define FIELD_NAME    17
+#define FIELD_AUTHOR  18
+#define FIELD_COMMENT 19
+#define ED_DIVIDER    39  /* column of │ between the two param columns */
+
+static PField pfields[NPARAMS];
+
 /* key-code → note index mapping  (ncurses keycodes → DATA indices) */
 /* We map printable keys to note indices the same way the C64 matrix did. */
 /* Upper keyboard row  Q..] and 2,3,5..= */
@@ -193,7 +216,6 @@ static void play_note(int t);
 static void release_note(void);
 static void randomise_patch(void);
 static void draw_keyboard_screen(void);
-static void draw_values_screen(void);
 static void prompt_line(int row, int col, const char *prompt, char *buf, int maxlen);
 static void save_patch(void);
 static void load_patch(void);
@@ -202,6 +224,7 @@ static void save_scale(const char *path);
 static void ui_load_scale(void);
 static void ui_save_scale(void);
 static void audio_tick(void);
+static void run_editor(void);
 static void run_main_loop(void);
 
 /* ══════════════════════════════════════════════════════════════════
@@ -684,7 +707,7 @@ static void prompt_line(int row, int col, const char *prompt, char *buf, int max
  */
 static void save_patch(void)
 {
-    patchbrowser_open_save(&patch);
+    patchbrowser_open_save(&patch, patch_name, patch_author, patch_comment);
 }
 
 /*
@@ -695,13 +718,17 @@ static void save_patch(void)
  */
 static void load_patch(void)
 {
-    Patch tmp = patch;                    /* scratch copy; browser fills it */
-    if (!patchbrowser_open_load(&tmp))
-        return;                           /* user cancelled */
+    Patch tmp = patch;
+    char  name[64] = "", author[64] = "", comment[128] = "";
+    if (!patchbrowser_open_load(&tmp, name, author, comment))
+        return;
     pthread_mutex_lock(&sid_lock);
     patch = tmp;
     apply_patch();
     pthread_mutex_unlock(&sid_lock);
+    snprintf(patch_name,    sizeof(patch_name),    "%s", name);
+    snprintf(patch_author,  sizeof(patch_author),  "%s", author);
+    snprintf(patch_comment, sizeof(patch_comment), "%s", comment);
 }
 
 /* ───────────────────────────────────────── scale load / save ── */
@@ -978,65 +1005,331 @@ static void draw_keyboard_screen(void)
     scope_redraw();
 }
 
+/* ───────────────────────────────────────── patch editor ── */
+
+static void init_pfields(void)
+{
+#define PF(i, v, lbl, fp, lo_, hi_, desc_) \
+    pfields[i] = (PField){ v, lbl, fp, lo_, hi_, desc_ }
+    PF( 0, "Z",  "voice mode",    &patch.z,  1, 6,
+        "1=oct up  2-5=normal  6=oct down");
+    PF( 1, "FL", "effect",        &patch.fl, 0, 2,
+        "0=none  1=vibrato  2=filter sweep");
+    PF( 2, "W1", "voice 1 wave",  &patch.w1, 0, 255,
+        "waveform+gate byte  17=tri 33=saw 65=pulse 129=noise");
+    PF( 3, "W2", "voice 2 wave",  &patch.w2, 0, 255,
+        "waveform+gate byte for voice 2");
+    PF( 4, "AT", "attack",        &patch.at, 0, 15,
+        "attack time  0=fastest  15=slowest");
+    PF( 5, "DE", "decay",         &patch.de, 0, 15,
+        "decay time  0=fastest  15=slowest");
+    PF( 6, "SU", "sustain",       &patch.su, 0, 15,
+        "sustain level  0=silent  15=full");
+    PF( 7, "RE", "release",       &patch.re, 0, 15,
+        "release time  0=fastest  15=slowest");
+    PF( 8, "PO", "resonance",     &patch.po, 0, 255,
+        "resonance and filter routing byte");
+    PF( 9, "XT", "sync speed",    &patch.xt, 0, 255,
+        "sync speed (stored; not yet applied to SID)");
+    PF(10, "VI", "vib speed",     &patch.vi, 0, 255,
+        "vibrato / LFO speed (voice 3 freq low byte)");
+    PF(11, "VS", "vib shape",     &patch.vs, 0, 255,
+        "LFO waveform  17=tri 33=saw 65=pulse 129=noise");
+    PF(12, "DB", "pulse v1",      &patch.db, 0, 255,
+        "pulse-width high byte for voice 1");
+    PF(13, "DC", "pulse v2",      &patch.dc, 0, 255,
+        "pulse-width high byte for voice 2");
+    PF(14, "DD", "pulse v3",      &patch.dd, 0, 255,
+        "pulse-width high byte for voice 3");
+    PF(15, "VO", "filter/vol",    &patch.vo, 0, 255,
+        "filter mode and master volume byte");
+    PF(16, "SL", "sweep limit",   &patch.sl, 0, 255,
+        "filter sweep upper limit (FL=2)");
+#undef PF
+}
+
 /*
- * Values screen — shows all patch parameters with their BASIC variable names
- * so the user can see what will be saved / was loaded.
+ * Draw one numeric param field at its position in the two-column grid.
+ * Fields 0-8 go in the left column (rows 3-11); 9-16 in the right (rows 3-10).
  */
-static void draw_values_screen(void)
+static void draw_ed_param(int fi, int sel)
+{
+    int row  = (fi < 9) ? (3 + fi) : (3 + fi - 9);
+    int scol = (fi < 9) ? 2 : (ED_DIVIDER + 2);
+    const PField *pf = &pfields[fi];
+    termw_move(row, scol);
+    if (sel)
+        printf(TW_REVERSE TW_BOLD "> %-2s %-13s %4d" TW_RESET,
+               pf->var, pf->label, *pf->field);
+    else
+        printf("  %-2s " TW_CYAN "%-13s" TW_RESET " %4d",
+               pf->var, pf->label, *pf->field);
+}
+
+/*
+ * Draw one metadata field (name / author / comment) at rows 13-15.
+ * edit=1: show underscore cursor; edit_buf holds the in-progress text.
+ */
+static void draw_ed_meta(int fi, int sel, int edit, const char *edit_buf)
+{
+    static const char *labels[3] = { "NAME   ", "AUTHOR ", "COMMENT" };
+    int         mi   = fi - NPARAMS;
+    int         row  = 13 + mi;
+    const char *text = edit ? edit_buf :
+                       (mi == 0 ? patch_name :
+                        mi == 1 ? patch_author : patch_comment);
+    termw_move(row, 2);
+    if (sel && !edit)
+        printf(TW_REVERSE TW_BOLD "> %-7s %-65.65s" TW_RESET, labels[mi], text);
+    else if (edit)
+        printf(TW_REVERSE TW_BOLD "> %-7s %-64.64s_" TW_RESET, labels[mi], text);
+    else
+        printf("  %-7s " TW_CYAN "%-65.65s" TW_RESET, labels[mi], text);
+}
+
+static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
 {
     termw_clear();
 
-    /* ── outer border ── */
+    /* outer border */
     printf(TW_YELLOW);
     termw_move(0, 0);
-    printf("╔");  for (int c = 1; c < 79; c++) printf("═");  printf("╗");
+    printf("╔"); for (int c = 1; c < 79; c++) printf("═"); printf("╗");
     for (int r = 1; r < 23; r++) {
         termw_move(r,  0); printf("║");
         termw_move(r, 79); printf("║");
     }
     termw_move(23, 0);
-    printf("╚");  for (int c = 1; c < 79; c++) printf("═");  printf("╝");
+    printf("╚"); for (int c = 1; c < 79; c++) printf("═"); printf("╝");
+
+    /* row 2: separator with column-divider tee */
+    termw_move(2, 0);
+    printf("╠");
+    for (int c = 1; c < 79; c++)
+        printf("%s", c == ED_DIVIDER ? "╤" : "═");
+    printf("╣");
+
+    /* rows 3-11: centre column divider */
+    for (int r = 3; r < 12; r++) { termw_move(r, ED_DIVIDER); printf("│"); }
+
+    /* row 12: separator collapsing the column tee */
+    termw_move(12, 0);
+    printf("╠");
+    for (int c = 1; c < 79; c++)
+        printf("%s", c == ED_DIVIDER ? "╧" : "═");
+    printf("╣");
+
+    /* rows 16, 22: full-width separators */
+    termw_move(16, 0);
+    printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
+    termw_move(22, 0);
+    printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
     printf(TW_RESET);
 
-    /* ── title ── */
-    termw_move(1, 28);
-    printf(TW_BOLD TW_BG_BLUE TW_WHITE "  VALUES SCREEN  " TW_RESET);
+    /* title */
+    termw_move(1, 2);
+    printf(TW_BOLD TW_BG_BLUE TW_WHITE " PATCH EDITOR " TW_RESET);
+    if (patch_name[0]) {
+        termw_move(1, 18);
+        printf(TW_CYAN "%.55s" TW_RESET, patch_name);
+    }
 
-    /* ── parameter table: label, BASIC variable name, current value ── */
-    int r = 3;
-#define VROW(label, val) do { \
-    termw_move(r++, 4); \
-    printf(TW_WHITE "%-24s" TW_RESET " = " TW_CYAN "%d" TW_RESET, label, val); \
-} while (0)
-    VROW("Z  (voice mode)",      patch.z);
-    VROW("FL (effect)",          patch.fl);
-    VROW("W1 (voice 1 waveform)",patch.w1);
-    VROW("W2 (voice 2 waveform)",patch.w2);
-    VROW("AT (attack)",          patch.at);
-    VROW("DE (decay)",           patch.de);
-    VROW("SU (sustain)",         patch.su);
-    VROW("RE (release)",         patch.re);
-    VROW("PO (resonance)",       patch.po);
-    VROW("XT (sync speed)",      patch.xt);
-    VROW("VI (vibrato speed)",   patch.vi);
-    VROW("VS (vibrato shape)",   patch.vs);
-    VROW("DB (pulse v1)",        patch.db);
-    VROW("DC (pulse v2)",        patch.dc);
-    VROW("DD (pulse v3)",        patch.dd);
-    VROW("VO (filter/volume)",   patch.vo);
-    VROW("SL (sweep limit)",     patch.sl);
-#undef VROW
+    /* all numeric params */
+    for (int i = 0; i < NPARAMS; i++)
+        draw_ed_param(i, i == sel);
 
-    termw_move(r + 1, 4);
-    printf(TW_BOLD TW_YELLOW "Press ENTER to return to keyboard screen." TW_RESET);
+    /* metadata rows */
+    for (int i = NPARAMS; i < NFIELDS; i++)
+        draw_ed_meta(i, i == sel,
+                     (edit_mode && i == sel) ? 1 : 0,
+                     (edit_mode && i == sel) ? edit_buf : "");
+
+    /* info area: range + one-line description */
+    termw_move(17, 2);
+    if (sel < NPARAMS) {
+        printf(TW_DIM "Range %d-%d  " TW_RESET "%.60s",
+               pfields[sel].lo, pfields[sel].hi, pfields[sel].desc);
+    } else {
+        static const char *meta_hints[3] = {
+            "Patch name stored in .pjs metadata",
+            "Author name stored in .pjs metadata",
+            "Freeform comment stored in .pjs metadata",
+        };
+        printf("%.72s", meta_hints[sel - NPARAMS]);
+    }
+
+    /* hints bar */
+    termw_move(23, 2);
+    if (edit_mode)
+        printf(TW_DIM "Type to edit  ENTER=confirm  ESC=cancel" TW_RESET);
+    else
+        printf(TW_DIM
+               "↑↓ navigate  ←→ adjust  ENTER=edit text  F5=save  ESC=back"
+               TW_RESET);
 
     termw_flush();
+}
+
+static void run_editor(void)
+{
+    init_pfields();
+
+    int  sel       = 0;
+    int  edit_mode = 0;
+    char orig_meta[128] = "";
+    char edit_buf[128]  = "";
+    int  edit_len       = 0;
+
+    struct timespec last_key_ts = {0, 0};
+#define RELEASE_MS 60L
+
+    draw_editor_screen(sel, 0, "");
+
+    for (;;) {
+        int ch = termw_read_key_timeout(5);
+
+        if (ch != -1) {
+            if (edit_mode) {
+                /* ── text edit mode ── */
+                if (ch == TK_ESC) {
+                    /* cancel: restore saved original */
+                    int mi = sel - NPARAMS;
+                    char *dst = (mi == 0) ? patch_name :
+                                (mi == 1) ? patch_author : patch_comment;
+                    size_t maxd = (mi == 2) ? sizeof(patch_comment) : sizeof(patch_name);
+                    snprintf(dst, maxd, "%s", orig_meta);
+                    edit_mode = 0;
+                    draw_editor_screen(sel, 0, "");
+                } else if (ch == TK_ENTER || ch == '\r') {
+                    edit_mode = 0;
+                    draw_editor_screen(sel, 0, "");
+                } else if ((ch == TK_BACKSPACE || ch == 127) && edit_len > 0) {
+                    edit_buf[--edit_len] = '\0';
+                    int mi = sel - NPARAMS;
+                    char *dst = (mi == 0) ? patch_name :
+                                (mi == 1) ? patch_author : patch_comment;
+                    strncpy(dst, edit_buf, (size_t)edit_len + 1);
+                    draw_ed_meta(sel, 1, 1, edit_buf);
+                    termw_flush();
+                } else if (ch >= 32 && ch < 127) {
+                    int mi     = sel - NPARAMS;
+                    int maxlen = (mi == 2) ? 127 : 63;
+                    if (edit_len < maxlen) {
+                        edit_buf[edit_len++] = (char)ch;
+                        edit_buf[edit_len]   = '\0';
+                        char *dst = (mi == 0) ? patch_name :
+                                    (mi == 1) ? patch_author : patch_comment;
+                        strncpy(dst, edit_buf, (size_t)edit_len + 1);
+                        draw_ed_meta(sel, 1, 1, edit_buf);
+                        termw_flush();
+                    }
+                }
+            } else {
+                /* ── navigation mode ── */
+                if (ch == TK_ESC) {
+                    /* gate off any held note and return to keyboard screen */
+                    pthread_mutex_lock(&sid_lock);
+                    release_note();
+                    pthread_mutex_unlock(&sid_lock);
+                    current_note = 0;
+                    break;
+                }
+
+                if (ch == TK_F5) {
+                    patchbrowser_open_save(&patch,
+                                           patch_name, patch_author, patch_comment);
+                    draw_editor_screen(sel, 0, "");
+                    goto ed_tick;
+                }
+
+                if (ch == TK_UP) {
+                    if (sel > 0) { sel--; draw_editor_screen(sel, 0, ""); }
+                } else if (ch == TK_DOWN) {
+                    if (sel < NFIELDS - 1) { sel++; draw_editor_screen(sel, 0, ""); }
+                } else if (ch == TK_LEFT || ch == TK_PGDN) {
+                    if (sel < NPARAMS) {
+                        int step = (ch == TK_PGDN) ? 10 : 1;
+                        pthread_mutex_lock(&sid_lock);
+                        *pfields[sel].field -= step;
+                        if (*pfields[sel].field < pfields[sel].lo)
+                            *pfields[sel].field = pfields[sel].lo;
+                        apply_patch();
+                        pthread_mutex_unlock(&sid_lock);
+                        draw_ed_param(sel, 1);
+                        termw_flush();
+                    }
+                } else if (ch == TK_RIGHT || ch == TK_PGUP) {
+                    if (sel < NPARAMS) {
+                        int step = (ch == TK_PGUP) ? 10 : 1;
+                        pthread_mutex_lock(&sid_lock);
+                        *pfields[sel].field += step;
+                        if (*pfields[sel].field > pfields[sel].hi)
+                            *pfields[sel].field = pfields[sel].hi;
+                        apply_patch();
+                        pthread_mutex_unlock(&sid_lock);
+                        draw_ed_param(sel, 1);
+                        termw_flush();
+                    }
+                } else if ((ch == TK_ENTER || ch == '\r') && sel >= NPARAMS) {
+                    /* enter text edit mode for the selected metadata field */
+                    int mi = sel - NPARAMS;
+                    const char *src = (mi == 0) ? patch_name :
+                                      (mi == 1) ? patch_author : patch_comment;
+                    size_t maxd = (mi == 2) ? sizeof(orig_meta) : sizeof(orig_meta);
+                    strncpy(orig_meta, src, maxd - 1);
+                    orig_meta[maxd - 1] = '\0';
+                    strncpy(edit_buf, src, sizeof(edit_buf) - 1);
+                    edit_buf[sizeof(edit_buf) - 1] = '\0';
+                    edit_len  = (int)strlen(edit_buf);
+                    edit_mode = 1;
+                    draw_ed_meta(sel, 1, 1, edit_buf);
+                    termw_move(23, 2);
+                    printf("%-76s", "");
+                    termw_move(23, 2);
+                    printf(TW_DIM "Type to edit  ENTER=confirm  ESC=cancel" TW_RESET);
+                    termw_flush();
+                }
+
+                /* note keys work the same as on the keyboard screen */
+                if (ch >= 0 && ch < 256) {
+                    int note = key_to_note[ch];
+                    if (note > 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &last_key_ts);
+                        if (current_note != note) {
+                            pthread_mutex_lock(&sid_lock);
+                            release_note();
+                            current_note = note;
+                            play_note(note);
+                            pthread_mutex_unlock(&sid_lock);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* key-up detection: release note if no repeat within RELEASE_MS */
+        if (!edit_mode && current_note > 0 && last_key_ts.tv_sec > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long ms = (now.tv_sec  - last_key_ts.tv_sec)  * 1000L
+                    + (now.tv_nsec - last_key_ts.tv_nsec) / 1000000L;
+            if (ms >= RELEASE_MS) {
+                pthread_mutex_lock(&sid_lock);
+                release_note();
+                pthread_mutex_unlock(&sid_lock);
+                current_note = 0;
+            }
+        }
+
+ed_tick:
+        audio_tick();
+    }
+#undef RELEASE_MS
 }
 
 /* ───────────────────────────────────────── main loop ── */
 static void run_main_loop(void)
 {
-    int show_values = 0;
     struct timespec last_key_ts = {0, 0}; /* time of last note-key event */
 
     /*
@@ -1068,10 +1361,11 @@ static void run_main_loop(void)
             if (ch == TK_F1) {
                 /* F1 – reset to default patch */
                 default_patch();
+                patch_name[0] = patch_author[0] = patch_comment[0] = '\0';
                 pthread_mutex_lock(&sid_lock);
                 apply_patch();
                 pthread_mutex_unlock(&sid_lock);
-                if (!show_values) draw_keyboard_screen();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_F3) {
@@ -1080,42 +1374,37 @@ static void run_main_loop(void)
                 pthread_mutex_lock(&sid_lock);
                 apply_patch();
                 pthread_mutex_unlock(&sid_lock);
-                if (!show_values) draw_keyboard_screen();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_F5) {
-                /* F5 – save patch (prompts for filename) */
+                /* F5 – save patch */
                 save_patch();
-                if (!show_values) draw_keyboard_screen();
-                else              draw_values_screen();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_F7) {
-                /* F7 – open patch browser (lock managed inside load_patch) */
+                /* F7 – open patch browser */
                 load_patch();
-                if (!show_values) draw_keyboard_screen();
-                else              draw_values_screen();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_F9) {
                 /* F9 – load user scale file */
                 ui_load_scale();
-                if (!show_values) draw_keyboard_screen();
-                else              draw_values_screen();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_F11) {
                 /* F11 – save current scale to file */
                 ui_save_scale();
-                if (!show_values) draw_keyboard_screen();
-                else              draw_values_screen();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_ENTER || ch == '\r' || ch == '\n') {
-                /* ENTER – toggle keyboard / values screen */
-                show_values = !show_values;
-                if (show_values) draw_values_screen();
-                else             draw_keyboard_screen();
+                /* ENTER – open patch editor */
+                run_editor();
+                draw_keyboard_screen();
                 goto next_tick;
             }
             if (ch == TK_ESC) {
@@ -1126,8 +1415,6 @@ static void run_main_loop(void)
                 current_note = 0;
                 break;
             }
-
-            if (show_values) goto next_tick;   /* note keys ignored on values screen */
 
             /* ── note key ── */
             if (ch >= 0 && ch < 256) {
@@ -1159,7 +1446,7 @@ static void run_main_loop(void)
                 release_note();
                 pthread_mutex_unlock(&sid_lock);
                 current_note = 0;
-                if (!show_values) draw_keyboard_screen();  /* remove green highlight */
+                draw_keyboard_screen();   /* remove green highlight */
             }
         }
 

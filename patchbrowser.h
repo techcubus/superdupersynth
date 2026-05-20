@@ -25,16 +25,19 @@ void patchbrowser_init(void);
 
 /*
  * Open the browser in LOAD mode.
- * Returns 1 and fills *p with the selected patch if the user chose a file.
+ * Returns 1 and fills *p (patch data) and name/author/comment (metadata,
+ * NUL-terminated) if the user chose a .pjs file.  For legacy files, name /
+ * author / comment are set to empty strings.
  * Returns 0 if the user pressed ESC without loading anything.
  */
-int patchbrowser_open_load(Patch *p);
+int patchbrowser_open_load(Patch *p, char *name, char *author, char *comment);
 
 /*
- * Open the browser in SAVE mode.
- * The user navigates to a directory and presses S to save *p there.
- * Returns 1 if the patch was saved, 0 if cancelled.
+ * Open the save dialog.
+ * name/author/comment are the patch metadata strings to embed in the .pjs file.
+ * Returns 1 if the patch was written, 0 if cancelled.
  */
-int patchbrowser_open_save(const Patch *p);
+int patchbrowser_open_save(const Patch *p,
+                           const char *name, const char *author, const char *comment);
 
 #endif /* PATCHBROWSER_H */
