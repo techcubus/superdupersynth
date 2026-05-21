@@ -22,9 +22,21 @@ void sixel_init(int force_sixel);
 void scope_feed(const short *buf, int count);
 
 /*
+ * Set the scope pixel dimensions (default 128×128).
+ * Both w and h are clamped to [8, 256].  Takes effect on the next redraw.
+ */
+void scope_set_size(int w, int h);
+
+/*
+ * Set the scope top-left position in terminal cells, 0-based (default row=4 col=46).
+ * Takes effect on the next redraw.
+ */
+void scope_set_pos(int row, int col);
+
+/*
  * Force an immediate scope redraw without waiting for the next interval.
  * Call this at the end of draw_keyboard_screen() so the scope is present
- * after every full ncurses refresh.
+ * after every full screen refresh.
  */
 void scope_redraw(void);
 

@@ -1,8 +1,9 @@
 /*
  * sixel.c  –  sixel oscilloscope for supersynth.
  *
- * Draws a 128×128-pixel green-phosphor oscilloscope to the right of the
- * piano keyboard using sixel terminal graphics (DEC VT340 protocol).
+ * Draws a green-phosphor oscilloscope using DEC VT340 sixel graphics.
+ * Position and pixel dimensions are runtime-configurable via scope_set_pos()
+ * and scope_set_size(); both can be called at any time before the next redraw.
  *
  * Sixel format:  ESC P q <palette> <bands> ESC \
  *   Each "band" is 6 rows tall; one character per column encodes which of
@@ -30,57 +31,65 @@
 
 #include "sixel.h"
 
-/* ── layout constants ──────────────────────────────────────────── */
-#define SCOPE_PX        128     /* image width and height in pixels          */
-#define SCOPE_ROW         4     /* terminal row of top-left corner (0-based) */
-#define SCOPE_COL        46     /* terminal column of top-left corner        */
-#define SCOPE_INTERVAL    4     /* redraw every N calls to scope_feed()      */
+/* ── compile-time limits ───────────────────────────────────────── */
+#define MAX_SCOPE_PX   256   /* maximum pixel dimension (w or h)              */
+#define SCOPE_INTERVAL   4   /* redraw every N calls to scope_feed()          */
 
-/* 128 rows / 6 = 21 full bands + 1 partial → 22 bands */
-#define SCOPE_BANDS     ((SCOPE_PX + 5) / 6)
+/*
+ * Output buffer sized for worst-case MAX_SCOPE_PX × MAX_SCOPE_PX image:
+ *   bands = (256+5)/6 = 43;  per band: 2 passes × (256 chars + "#N" + '$'/'-') ≈ 520 bytes
+ *   43 × 520 + header/palette ≈ 22 400 bytes  →  32 KB is comfortable.
+ */
+#define SIXEL_BUFSZ    32768
 
-/* output buffer: 22 bands × 2 passes × ~130 bytes + header/palette ≈ 6 KB */
-#define SIXEL_BUFSZ     8192
-
-/* SCOPE_SAMPLES must match AUDIO_FRAMES in supersynth.c */
-#define SCOPE_SAMPLES   512
+/* SCOPE_SAMPLES must be >= AUDIO_FRAMES in supersynth.c */
+#define SCOPE_SAMPLES  512
 
 /* ── module state (all file-private) ──────────────────────────── */
-static int   sixel_ok       = 0;                /* 1 when terminal supports sixel    */
-static int   tty_fd         = -1;               /* /dev/tty fd for raw terminal I/O  */
-static short scope_buf[SCOPE_SAMPLES];          /* last audio buffer snapshot        */
-static int   scope_tick_ctr = 0;               /* counts calls since last redraw    */
+static int   sixel_ok       = 0;
+static int   tty_fd         = -1;
+static short scope_buf[SCOPE_SAMPLES];
+static int   scope_tick_ctr = 0;
+
+/* runtime-configurable position and size (defaults match the original constants) */
+static int   scope_w   = 128;   /* image width in pixels  */
+static int   scope_h   = 128;   /* image height in pixels */
+static int   scope_row = 4;     /* terminal row, 0-based  */
+static int   scope_col = 46;    /* terminal col, 0-based  */
 
 /* ── internal helpers ──────────────────────────────────────────── */
 
 /*
- * Rasterise scope_buf into a 128×128 pixel bitmap and write it to the
- * terminal as a sixel image positioned at (SCOPE_ROW, SCOPE_COL).
+ * Rasterise scope_buf into a scope_w × scope_h pixel bitmap and write it
+ * to the terminal as a sixel image positioned at (scope_row, scope_col).
  */
 static void render_scope(void)
 {
+    int bands = (scope_h + 5) / 6;
+
+    /* pixel buffer — indexed [row][col]; static keeps it off the stack */
+    static unsigned char px[MAX_SCOPE_PX][MAX_SCOPE_PX];
+    /* clear only the rows we will use */
+    for (int y = 0; y < scope_h; y++)
+        memset(px[y], 0, (size_t)scope_w);
+
     /* ── rasterise ── */
-    /* 0 = black, 1 = bright green (trace), 2 = dim green (glow halo) */
-    static unsigned char px[SCOPE_PX][SCOPE_PX];
-    memset(px, 0, sizeof(px));
+    int prev_y = scope_h / 2;
+    for (int x = 0; x < scope_w; x++) {
+        int si = (scope_w > 1)
+                 ? (x * (SCOPE_SAMPLES - 1)) / (scope_w - 1)
+                 : 0;
+        int y = scope_h / 2
+                - (int)((scope_buf[si] * (scope_h / 2 - 2)) / 32768);
+        if (y <  0)       y = 0;
+        if (y >= scope_h) y = scope_h - 1;
 
-    int prev_y = SCOPE_PX / 2;
-    for (int x = 0; x < SCOPE_PX; x++) {
-        /* one representative sample per screen column */
-        int si = (x * (SCOPE_SAMPLES - 1)) / (SCOPE_PX - 1);
-        /* map sample value to pixel row; centre line at SCOPE_PX/2 */
-        int y = SCOPE_PX/2 - (int)((scope_buf[si] * (SCOPE_PX/2 - 2)) / 32768);
-        y = y <  0         ?  0          : y;
-        y = y >= SCOPE_PX  ?  SCOPE_PX-1 : y;
-
-        /* draw vertical segment from prev_y to y — no gaps between columns */
         int y0 = prev_y < y ? prev_y : y;
         int y1 = prev_y > y ? prev_y : y;
         for (int vy = y0; vy <= y1; vy++) {
             px[vy][x] = 1;
-            /* glow: dim halo one pixel above and below the bright trace */
-            if (vy > 0         && px[vy-1][x] == 0) px[vy-1][x] = 2;
-            if (vy < SCOPE_PX-1 && px[vy+1][x] == 0) px[vy+1][x] = 2;
+            if (vy > 0          && px[vy-1][x] == 0) px[vy-1][x] = 2;
+            if (vy < scope_h-1  && px[vy+1][x] == 0) px[vy+1][x] = 2;
         }
         prev_y = y;
     }
@@ -97,30 +106,28 @@ static void render_scope(void)
     SOUT("#1;2;0;90;10");     /* colour 1 = bright phosphor green    */
     SOUT("#2;2;0;35;4");      /* colour 2 = dim glow                 */
 
-    for (int band = 0; band < SCOPE_BANDS; band++) {
+    for (int band = 0; band < bands; band++) {
         int row0 = band * 6;
 
-        /* pass A: bright trace pixels (colour 1) */
         SOUT("#1");
-        for (int x = 0; x < SCOPE_PX; x++) {
+        for (int x = 0; x < scope_w; x++) {
             int bits = 0;
             for (int b = 0; b < 6; b++) {
                 int vy = row0 + b;
-                if (vy < SCOPE_PX && px[vy][x] == 1) bits |= (1 << b);
+                if (vy < scope_h && px[vy][x] == 1) bits |= (1 << b);
             }
-            SCHAR(bits + 0x3F);  /* sixel char: 0x3F=blank, 0x40=bit0 lit, ... 0x7E=all lit */
+            SCHAR(bits + 0x3F);
         }
         SCHAR('$');   /* carriage return — back to start of this band */
 
-        /* pass B: glow halo pixels (colour 2) */
         SOUT("#2");
-        for (int x = 0; x < SCOPE_PX; x++) {
+        for (int x = 0; x < scope_w; x++) {
             int bits = 0;
             for (int b = 0; b < 6; b++) {
                 int vy = row0 + b;
-                if (vy < SCOPE_PX && px[vy][x] == 2) bits |= (1 << b);
+                if (vy < scope_h && px[vy][x] == 2) bits |= (1 << b);
             }
-            SCHAR(bits + 0x3F);  /* sixel char: 0x3F=blank, 0x40=bit0 lit, ... 0x7E=all lit */
+            SCHAR(bits + 0x3F);
         }
         SCHAR('-');   /* sixel newline — advance to next band         */
     }
@@ -130,11 +137,10 @@ static void render_scope(void)
 #undef SOUT
 #undef SCHAR
 
-    /* ── write to terminal ── */
-    /* position cursor, then dump the sixel blob */
+    /* position cursor then dump the sixel blob */
     char csi[32];
     int clen = snprintf(csi, sizeof(csi),
-                        "\033[%d;%dH", SCOPE_ROW + 1, SCOPE_COL + 1);
+                        "\033[%d;%dH", scope_row + 1, scope_col + 1);
     write(tty_fd, csi, clen);
     write(tty_fd, sbuf, pos);
 }
@@ -147,16 +153,10 @@ void sixel_init(int force_sixel)
     if (tty_fd < 0) return;
 
     if (force_sixel) {
-        /* -x: trust the user, skip detection */
         sixel_ok = 1;
         return;
     }
 
-    /*
-     * Send Primary Device Attributes query and read the response.
-     * The terminal must be in raw mode so the response isn't echoed and
-     * doesn't require a newline to be flushed.  Restore normal mode after.
-     */
     struct termios old, raw;
     if (tcgetattr(STDIN_FILENO, &old) < 0) return;
     raw = old;
@@ -165,7 +165,7 @@ void sixel_init(int force_sixel)
 
     write(STDOUT_FILENO, "\033[c", 3);
 
-    struct timeval tv = {0, 250000};   /* 250 ms timeout */
+    struct timeval tv = {0, 250000};
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(STDIN_FILENO, &fds);
@@ -175,7 +175,6 @@ void sixel_init(int force_sixel)
         int n = read(STDIN_FILENO, buf, sizeof(buf) - 1);
         if (n > 0) {
             buf[n] = '\0';
-            /* sixel flag = "4" as an isolated parameter: ?4; ?4c ;4; ;4c */
             for (char *p = buf; *p; p++) {
                 if ((*p == '?' || *p == ';') &&
                     *(p+1) == '4' &&
@@ -190,11 +189,26 @@ void sixel_init(int force_sixel)
     tcsetattr(STDIN_FILENO, TCSANOW, &old);
 }
 
+void scope_set_size(int w, int h)
+{
+    if (w <  8) w =  8;
+    if (w > MAX_SCOPE_PX) w = MAX_SCOPE_PX;
+    if (h <  8) h =  8;
+    if (h > MAX_SCOPE_PX) h = MAX_SCOPE_PX;
+    scope_w = w;
+    scope_h = h;
+}
+
+void scope_set_pos(int row, int col)
+{
+    scope_row = row;
+    scope_col = col;
+}
+
 void scope_feed(const short *buf, int count)
 {
     if (!sixel_ok || tty_fd < 0) return;
 
-    /* snapshot the audio buffer (cap at SCOPE_SAMPLES) */
     int n = count < SCOPE_SAMPLES ? count : SCOPE_SAMPLES;
     memcpy(scope_buf, buf, (size_t)n * sizeof(short));
 
@@ -206,7 +220,6 @@ void scope_feed(const short *buf, int count)
 
 void scope_redraw(void)
 {
-    /* force a redraw regardless of the tick counter (e.g. after screen clear) */
     if (!sixel_ok || tty_fd < 0) return;
     render_scope();
 }
