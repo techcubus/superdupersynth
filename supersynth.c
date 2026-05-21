@@ -1001,8 +1001,7 @@ static void draw_keyboard_screen(void)
            TW_RESET);
 
     termw_flush();
-
-    /* sixel scope overlay — draw after flushing text; persists until next termw_clear() */
+    scope_set_pos(4, 46);
     scope_redraw();
 }
 
@@ -1123,31 +1122,11 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
     termw_move(23, 0);
     printf("╚"); for (int c = 1; c < 79; c++) printf("═"); printf("╝");
 
-    /* row 2: separator with two column-divider tees */
+    /* rows 2 and 12: plain full-width separators */
     termw_move(2, 0);
-    printf("╠");
-    for (int c = 1; c < 79; c++) {
-        if      (c == ED_DIV1) printf("╤");
-        else if (c == ED_DIV2) printf("╤");
-        else                   printf("═");
-    }
-    printf("╣");
-
-    /* rows 3-11: two column dividers */
-    for (int r = 3; r < 12; r++) {
-        termw_move(r, ED_DIV1); printf("│");
-        termw_move(r, ED_DIV2); printf("│");
-    }
-
-    /* row 12: close both column tees */
+    printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
     termw_move(12, 0);
-    printf("╠");
-    for (int c = 1; c < 79; c++) {
-        if      (c == ED_DIV1) printf("╧");
-        else if (c == ED_DIV2) printf("╧");
-        else                   printf("═");
-    }
-    printf("╣");
+    printf("╠"); for (int c = 1; c < 79; c++) printf("═"); printf("╣");
 
     /* rows 16 and 22: full-width separators */
     termw_move(16, 0);
@@ -1163,10 +1142,6 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
         termw_move(1, 18);
         printf(TW_CYAN "%.25s" TW_RESET, patch_name);  /* cols 18-44 */
     }
-
-    /* scope column header (rows 1 and 3 — above the sixel image which starts row 4) */
-    termw_move(1, ED_DIV2 + 2);
-    printf(TW_DIM "oscilloscope" TW_RESET);
 
     /* all numeric params */
     for (int i = 0; i < NPARAMS; i++)
@@ -1201,8 +1176,9 @@ static void draw_editor_screen(int sel, int edit_mode, const char *edit_buf)
                "↑↓ nav  ←→ adjust  ENTER=edit  F5=save  ESC=back"
                TW_RESET);
 
-    /* sixel scope overlay — flush text first, then write scope to /dev/tty */
+    /* sixel scope overlay — right-aligned against the right border */
     termw_flush();
+    scope_set_pos(4, 63);
     scope_redraw();
 }
 
