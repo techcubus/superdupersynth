@@ -158,14 +158,16 @@ typedef struct {
     const char *label;  /* short description, e.g. "attack" */
     int        *field;  /* pointer into the global patch struct */
     int         lo, hi; /* inclusive valid range */
+    int         shift;  /* right-shift applied when reading/writing sub-byte fields */
+    int         mask;   /* bitmask applied to *field before shifting */
     const char *desc;   /* one-line info shown in the editor */
 } PField;
 
-#define NPARAMS     17   /* numeric patch fields */
-#define NFIELDS     20   /* NPARAMS + 3 metadata fields */
-#define FIELD_NAME    17
-#define FIELD_AUTHOR  18
-#define FIELD_COMMENT 19
+#define NPARAMS     18   /* numeric patch fields */
+#define NFIELDS     21   /* NPARAMS + 3 metadata fields */
+#define FIELD_NAME    18
+#define FIELD_AUTHOR  19
+#define FIELD_COMMENT 20
 #define ED_DIV1       24  /* │ between left and centre param columns */
 #define ED_DIV2       45  /* │ between centre column and scope area  */
 
@@ -1009,41 +1011,45 @@ static void draw_keyboard_screen(void)
 
 static void init_pfields(void)
 {
-#define PF(i, v, lbl, fp, lo_, hi_, desc_) \
-    pfields[i] = (PField){ v, lbl, fp, lo_, hi_, desc_ }
-    PF( 0, "Z",  "voice mode",    &patch.z,  1, 6,
+    /* sh_=shift, msk_=bitmask — whole-byte fields use 0,0xFF */
+#define PF(i, v, lbl, fp, lo_, hi_, sh_, msk_, desc_) \
+    pfields[i] = (PField){ v, lbl, fp, lo_, hi_, sh_, msk_, desc_ }
+    PF( 0, "Z",  "voice mode",    &patch.z,  1,  6, 0, 0xFF,
         "1=oct up  2-5=normal  6=oct down");
-    PF( 1, "FL", "effect",        &patch.fl, 0, 2,
+    PF( 1, "FL", "effect",        &patch.fl, 0,  2, 0, 0xFF,
         "0=none  1=vibrato  2=filter sweep");
-    PF( 2, "W1", "v1 waveform",   &patch.w1, 0, 255,
+    PF( 2, "W1", "v1 waveform",   &patch.w1, 0, 255, 0, 0xFF,
         "waveform+gate byte  17=tri 33=saw 65=pulse 129=noise");
-    PF( 3, "W2", "v2 waveform",   &patch.w2, 0, 255,
+    PF( 3, "W2", "v2 waveform",   &patch.w2, 0, 255, 0, 0xFF,
         "waveform+gate byte for voice 2");
-    PF( 4, "AT", "attack",        &patch.at, 0, 15,
+    PF( 4, "AT", "attack",        &patch.at, 0, 15, 0, 0xFF,
         "attack time  0=fastest  15=slowest");
-    PF( 5, "DE", "decay",         &patch.de, 0, 15,
+    PF( 5, "DE", "decay",         &patch.de, 0, 15, 0, 0xFF,
         "decay time  0=fastest  15=slowest");
-    PF( 6, "SU", "sustain",       &patch.su, 0, 15,
+    PF( 6, "SU", "sustain",       &patch.su, 0, 15, 0, 0xFF,
         "sustain level  0=silent  15=full");
-    PF( 7, "RE", "release",       &patch.re, 0, 15,
+    PF( 7, "RE", "release",       &patch.re, 0, 15, 0, 0xFF,
         "release time  0=fastest  15=slowest");
-    PF( 8, "PO", "resonance",     &patch.po, 0, 255,
+    PF( 8, "PO", "resonance",     &patch.po, 0, 255, 0, 0xFF,
         "resonance and filter routing byte");
-    PF( 9, "XT", "sync speed",    &patch.xt, 0, 255,
+    PF( 9, "XT", "sync speed",    &patch.xt, 0, 255, 0, 0xFF,
         "sync speed (stored; not yet applied to SID)");
-    PF(10, "VI", "vib speed",     &patch.vi, 0, 255,
+    PF(10, "VI", "vib speed",     &patch.vi, 0, 255, 0, 0xFF,
         "vibrato / LFO speed (voice 3 freq low byte)");
-    PF(11, "VS", "vib shape",     &patch.vs, 0, 255,
+    PF(11, "VS", "vib shape",     &patch.vs, 0, 255, 0, 0xFF,
         "LFO waveform  17=tri 33=saw 65=pulse 129=noise");
-    PF(12, "DB", "pulse v1",      &patch.db, 0, 255,
+    PF(12, "DB", "pulse v1",      &patch.db, 0, 255, 0, 0xFF,
         "pulse-width high byte for voice 1");
-    PF(13, "DC", "pulse v2",      &patch.dc, 0, 255,
+    PF(13, "DC", "pulse v2",      &patch.dc, 0, 255, 0, 0xFF,
         "pulse-width high byte for voice 2");
-    PF(14, "DD", "pulse v3",      &patch.dd, 0, 255,
+    PF(14, "DD", "pulse v3",      &patch.dd, 0, 255, 0, 0xFF,
         "pulse-width high byte for voice 3");
-    PF(15, "VO", "filter/vol",    &patch.vo, 0, 255,
-        "filter mode and master volume byte");
-    PF(16, "SL", "sweep lim",     &patch.sl, 0, 255,
+    /* patch.vo = MODE_VOL (SID reg 24): bits 6-4=filter mode, bits 3-0=volume */
+    PF(15, "FM", "flt mode",      &patch.vo, 0,  7, 4, 0x70,
+        "filter mode bits 4-6: 0=off  1=LP  2=BP  4=HP  (combine: 3=LP+BP etc)");
+    PF(16, "VL", "volume",        &patch.vo, 0, 15, 0, 0x0F,
+        "master volume  0=silent  15=full");
+    PF(17, "SL", "sweep lim",     &patch.sl, 0, 255, 0, 0xFF,
         "filter sweep upper limit (FL=2)");
 #undef PF
 }
@@ -1063,24 +1069,25 @@ static void draw_ed_param(int fi, int sel)
         row  = 3 + (fi - 9);
         scol = ED_DIV1 + 1;
     }
-    const PField *pf = &pfields[fi];
+    const PField *pf  = &pfields[fi];
+    int           val = (*pf->field & pf->mask) >> pf->shift;
     termw_move(row, scol);
     if (fi < 9) {
         /* left column: 11-char label, 4-digit value */
         if (sel)
             printf(TW_REVERSE TW_BOLD "> %-2s %-11.11s%4d" TW_RESET,
-                   pf->var, pf->label, *pf->field);
+                   pf->var, pf->label, val);
         else
             printf("  %-2s " TW_CYAN "%-11.11s" TW_RESET "%4d",
-                   pf->var, pf->label, *pf->field);
+                   pf->var, pf->label, val);
     } else {
         /* centre column: 10-char label, 3-digit value */
         if (sel)
             printf(TW_REVERSE TW_BOLD "> %-2s %-10.10s%3d" TW_RESET,
-                   pf->var, pf->label, *pf->field);
+                   pf->var, pf->label, val);
         else
             printf("  %-2s " TW_CYAN "%-10.10s" TW_RESET "%3d",
-                   pf->var, pf->label, *pf->field);
+                   pf->var, pf->label, val);
     }
 }
 
@@ -1261,10 +1268,12 @@ static void run_editor(void)
                 } else if (ch == TK_LEFT || ch == TK_PGDN) {
                     if (sel < NPARAMS) {
                         int step = (ch == TK_PGDN) ? 10 : 1;
+                        const PField *pf = &pfields[sel];
                         pthread_mutex_lock(&sid_lock);
-                        *pfields[sel].field -= step;
-                        if (*pfields[sel].field < pfields[sel].lo)
-                            *pfields[sel].field = pfields[sel].lo;
+                        int cur = (*pf->field & pf->mask) >> pf->shift;
+                        int nv  = cur - step;
+                        if (nv < pf->lo) nv = pf->lo;
+                        *pf->field = (*pf->field & ~pf->mask) | ((nv << pf->shift) & pf->mask);
                         apply_patch();
                         pthread_mutex_unlock(&sid_lock);
                         draw_ed_param(sel, 1);
@@ -1273,10 +1282,12 @@ static void run_editor(void)
                 } else if (ch == TK_RIGHT || ch == TK_PGUP) {
                     if (sel < NPARAMS) {
                         int step = (ch == TK_PGUP) ? 10 : 1;
+                        const PField *pf = &pfields[sel];
                         pthread_mutex_lock(&sid_lock);
-                        *pfields[sel].field += step;
-                        if (*pfields[sel].field > pfields[sel].hi)
-                            *pfields[sel].field = pfields[sel].hi;
+                        int cur = (*pf->field & pf->mask) >> pf->shift;
+                        int nv  = cur + step;
+                        if (nv > pf->hi) nv = pf->hi;
+                        *pf->field = (*pf->field & ~pf->mask) | ((nv << pf->shift) & pf->mask);
                         apply_patch();
                         pthread_mutex_unlock(&sid_lock);
                         draw_ed_param(sel, 1);
