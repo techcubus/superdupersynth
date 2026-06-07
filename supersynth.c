@@ -203,6 +203,7 @@ static int current_note = 0;
  */
 static int note_active  = 0;   /* 1 while a note is gated on */
 static int fl_sweep_pos = 0;   /* current FC_HI value for FL=2 sweep */
+static int z4_sweep_pos = 0;   /* current V1_FREQ_HI value for Z=4 pitch sweep */
 
 /* protects all reSID register access against concurrent MIDI thread writes */
 static pthread_mutex_t sid_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -458,9 +459,10 @@ static void play_note(int t)
     sid_write(V1_CTRL, patch.w1);
     sid_write(V2_CTRL, patch.w2);
 
-    /* reset FL effect state for the new note */
+    /* reset per-note effect state */
     note_active  = 1;
     fl_sweep_pos = 0;
+    z4_sweep_pos = 0;
 }
 
 static void release_note(void)
@@ -505,6 +507,7 @@ static void play_note_freq(unsigned int freq)
     sid_write(V2_CTRL, patch.w2);
     note_active  = 1;
     fl_sweep_pos = 0;
+    z4_sweep_pos = 0;
 }
 
 /*
@@ -528,15 +531,16 @@ static void midi_note_off_cb(void)
 
 /* ───────────────────────────────────────── FL effect tick ── */
 /*
- * Advance the active FL effect by one audio buffer's worth.
+ * Advance the active note effect by one audio buffer's worth.
  * Called once per audio_tick() while note_active is set.
  *
+ * Z=4 pitch sweep (checked first, exclusive with FL effects per BASIC lines 380-390)
+ *   Each tick, step V1_FREQ_HI from 0 up toward patch.sl in increments of patch.xt.
+ *   BASIC line 380: FOR U=1 TO SL STEP XT : POKEV+1,U
+ *
  * FL=1 vibrato
- *   Advance an 8-bit LFO phase accumulator by patch.vi each tick.
- *   Convert the phase to a waveform value (matching patch.vs shape codes)
- *   and write it to voices 1+2 freq LO to modulate pitch.
- *   The BASIC read voice-3 oscillator output for this; we replicate the
- *   waveform arithmetic directly since reSID doesn't expose that register.
+ *   Read voice 3 oscillator output (SID reg 0x1B) and write to voices 1+2 freq LO.
+ *   BASIC line 400: POKEV,PEEK(V+27):POKEV+7,PEEK(V+27)
  *
  * FL=2 filter sweep
  *   Step FC_HI up from 0 toward patch.sl in increments of 10, then hold.
@@ -545,6 +549,15 @@ static void midi_note_off_cb(void)
 static void fl_tick(void)
 {
     if (!note_active) return;
+
+    /* Z=4 pitch sweep — exclusive with FL effects, matches BASIC flow */
+    if (patch.z == 4) {
+        int step = patch.xt > 0 ? patch.xt : 1;
+        z4_sweep_pos += step;
+        if (z4_sweep_pos > patch.sl) z4_sweep_pos = patch.sl;
+        sid_write(V1_FREQ_HI, z4_sweep_pos);
+        return;
+    }
 
     switch (patch.fl) {
     case 1: {
@@ -1032,8 +1045,8 @@ static void init_pfields(void)
         "release time  0=fastest  15=slowest");
     PF( 8, "PO", "resonance",     &patch.po, 0, 255, 0, 0xFF,
         "resonance and filter routing byte");
-    PF( 9, "XT", "sync speed",    &patch.xt, 0, 255, 0, 0xFF,
-        "sync speed (stored; not yet applied to SID)");
+    PF( 9, "XT", "sweep step",    &patch.xt, 1, 255, 0, 0xFF,
+        "Z=4 pitch sweep step size per tick  1=slow  255=fast");
     PF(10, "VI", "vib speed",     &patch.vi, 0, 255, 0, 0xFF,
         "vibrato / LFO speed (voice 3 freq low byte)");
     PF(11, "VS", "vib shape",     &patch.vs, 0, 255, 0, 0xFF,
