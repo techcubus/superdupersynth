@@ -3,6 +3,8 @@
 
 # Build output
 supersynth
+seqclock
+sequencer
 
 # Object files
 *.o
