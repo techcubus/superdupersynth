@@ -621,19 +621,20 @@ static void audio_tick(void)
 /* ───────────────────────────────────────── randomise patch ── */
 static void randomise_patch(void)
 {
-    /* waveform control bytes: triangle=17, sawtooth=33, pulse=65, noise=129,
-     * tri+pulse=21, saw+pulse=23, all=85  (gate bit not included here) */
-    static const int waveforms[] = {17,33,65,129,21,23,85};
-    static const int vols[]      = {31,45,79};    /* low-pass=31, band=45, high=79 */
-    static const int vs_vals[]   = {17,33,65,129};/* LFO waveform shapes */
-    static const int po_vals[]   = {240,241,242,243}; /* resonance/filter routing */
+    /* W1: 7 waveform choices (BASIC line 710: int(7*rnd)+1) */
+    static const int w1_vals[] = {17,33,65,129,21,23,85};
+    /* W2: 8 choices — includes 1 (gate only, silences voice 2) (BASIC line 790: int(8*rnd)+1) */
+    static const int w2_vals[] = {1,17,33,65,129,21,23,85};
+    static const int vols[]    = {31,45,79};     /* low-pass=31, band=45, high=79 */
+    static const int vs_vals[] = {17,33,65,129}; /* LFO waveform shapes */
+    static const int po_vals[] = {240,241,242,243}; /* resonance/filter routing */
 
     patch.z   = (rand() % 6) + 1;
     patch.fl  = rand() % 3;
     patch.sl  = (rand() % 255) + 1;
 
-    patch.w1  = waveforms[rand() % 7];
-    patch.w2  = waveforms[rand() % 7];
+    patch.w1  = w1_vals[rand() % 7];
+    patch.w2  = w2_vals[rand() % 8];
 
     patch.at  = (rand() % 10) + 1;
     patch.de  = (rand() % 15) + 1;
@@ -1007,8 +1008,9 @@ static void draw_keyboard_screen(void)
            patch.z, patch.fl, patch.w1, patch.w2,
            patch.at, patch.de, patch.su, patch.re);
     termw_move(17, 4);
-    printf(TW_GREEN "Vol:%-2d  Res:%-3d  VI:%-3d  VS:%-3d  SL:%-3d" TW_RESET,
-           patch.vo, patch.po, patch.vi, patch.vs, patch.sl);
+    printf(TW_GREEN "FM:%-2d  VL:%-2d  Res:%-3d  VI:%-3d  VS:%-3d  SL:%-3d" TW_RESET,
+           (patch.vo & 0x70) >> 4, patch.vo & 0x0F,
+           patch.po, patch.vi, patch.vs, patch.sl);
 
     /* ── status / hint bar ── */
     termw_move(22, 2);
